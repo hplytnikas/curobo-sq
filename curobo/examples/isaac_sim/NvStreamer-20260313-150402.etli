@@ -1,0 +1,21 @@
+17162,MarkQosNameValue,SurfaceBitDepth,8
+17162,MarkQosNameValue,AdapterWidth,1280
+17162,MarkQosNameValue,AllTransitSelectionValuesForwarded,
+17162,MarkQosNameValue,IsCoProc,0
+17162,MarkQosNameValue,DriverBranch,NVIDIA UNIX x86_64 Kernel Module  580.126.09  Wed Jan  7 22:59:56 UTC 2026
+17162,MarkQosNameValue,AdapterRefreshRate,60.0
+17162,MarkQosNameValue,Device,NVIDIA GeForce RTX 4070 Ti SUPER
+17162,MarkQosNameValue,AdapterHeight,720
+17162,MarkQosNameValue,TransitSelectionValueForwarded,0
+17162,MarkQosNameValue,LtrEnabled,0
+17162,MarkQosNameValue,EncoderInputSurfaceFormat,invalid_format
+17162,MarkQosNameValue,AllTransitSelectionValuesApplied,
+17162,MarkQosNameValue,TransitSelectionValueApplied,0
+17162,MarkQosNameValue,DriverVersion,580.12
+17162,MarkQosNameValue,DataChannelMode,DcSCTP
+17162,MarkQos,StreamServerBackendMode is 2
+17162,MarkQos,stream 0 nvtime::sessionStartTime[us] on server: 23708353494
+17162,MarkQos,RL QOS disabled for stream: 0
+17162,MarkGsBlobStats,
+17502,MarkQos,Number of delayed commands: 0
+17502,MarkGsBlobStats,

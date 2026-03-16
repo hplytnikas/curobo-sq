@@ -1,0 +1,21 @@
+checkpoints_folder: #PATH TO CHECKPOINT FOLDER
+checkpoint_file: # NAME of CHECKPOINT FILE
+config_file: config.yaml # NAME of CONFIG FILE
+device: "cuda"
+dataloader:
+  dataset: shapenet 
+  batch_size: 128
+  num_workers: 4
+shapenet:
+  split: test
+  path: "data/ShapeNet"
+  normalize: false
+  categories: null
+scenes_dataset:
+  split: val
+  path: "data/scannetpp"
+  normalize: true
+  gt: true
+  fps: false
+evaluation:
+  resolution: 100 

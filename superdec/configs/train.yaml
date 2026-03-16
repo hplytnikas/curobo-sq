@@ -1,0 +1,91 @@
+seed: 42
+use_wandb: false
+wandb:
+  project: #insert PROJECT NAME
+  entity: #insert USERNAME
+run_name: superdec_base
+dataset: shapenet  
+device: cuda
+
+checkpoints:
+  resume_from: #
+  keep_epoch: False
+
+superdec:
+  decoder:
+    n_queries: 16
+    n_layers: 3 # number of transformer decoders
+    n_heads: 1
+    masked_attention: false
+    swapped_attention: false
+    dim_feedforward: 512 # default
+    deep_supervision: False
+    pos_encoding_type: sinusoidal
+  point_encoder:
+    in_channels: 3
+    out_channels: 128
+    kernel_size: 3
+    resolution: 32
+    voxelization:
+      normalize: True
+      eps: 0
+    l1:
+      in_channels: 3
+      out_channels: 64
+      kernel_size: 3
+      resolution: 32
+      voxelization:
+        normalize: True
+        eps: 0
+    l2:
+      in_channels: 64
+      out_channels: 128
+      kernel_size: 3
+      resolution: 16
+      voxelization:
+        normalize: True
+        eps: 0
+    l3:
+      in_channels: 128
+      out_channels: 128
+      kernel_size: 3
+      resolution: 16
+      voxelization:
+        normalize: True
+        eps: 0  
+
+shapenet:
+  path: data/ShapeNet
+  categories: null #['03001627'] 
+  normalize: False
+
+trainer:
+  save_path: checkpoints
+  save_every_n_epochs: 50
+  num_epochs: 1000
+  batch_size: 32
+  num_workers: 4
+  evaluate_every_n_epochs: 1
+  augmentations: True
+optimizer:
+  lr: 4e-4 #1e-4 #1e-4   0.001
+  weight_decay: 0 # default
+  betas: [0.9, 0.999] # default
+  enable_scheduler: True # True
+  only_heads: False
+
+scheduler:  
+  _target_: torch.optim.lr_scheduler.OneCycleLR 
+  max_lr: ${optimizer.lr} 
+  epochs: ${trainer.num_epochs}
+  steps_per_epoch: -1
+
+loss:
+  n_samples: 500
+  w_sps: 0.1 #0.6 
+  w_ext: 0.01 #0.01 
+  w_cub: 1.0 #1.0 
+  w_cd: 1.0
+  
+visualization:
+  res_primitives: 40

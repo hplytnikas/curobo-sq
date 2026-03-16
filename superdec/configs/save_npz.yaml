@@ -1,0 +1,21 @@
+checkpoints_folder: checkpoints/shapenet
+checkpoint_file: ckpt.pt
+output_dir: output_npz
+config_file: config.yaml
+device: "cuda"
+dataset: shapenet
+dataloader:
+  split: test
+  batch_size: 128
+  num_workers: 4
+shapenet:
+  path: "data/ShapeNet"
+  normalize: false
+  categories: null
+scene:
+  path: data
+  name: scene_example
+  z_up: true
+  gt: true
+evaluation:
+  resolution: 50 

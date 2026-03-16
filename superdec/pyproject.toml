@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "superdec"
+description = "SuperDec"
+authors = [
+    { name = "Elisabetta Fedele" },
+    { name = "Boyang Sun" },
+    { name = "Leonidas Guibas" },
+    { name = "Marc Pollefeys" },
+    { name = "Francis Engelmann" }
+]
+readme = "README.md"
+urls = {github = "https://github.com/elisabettafedele/superdec"}
+dynamic = ["version"]
+
+[tool.setuptools]
+packages = ["superdec"]
+
+[tool.setuptools.dynamic]
+version = {attr = "superdec.__version__"}

@@ -1,0 +1,2 @@
+from superdec.functional.devoxelization import trilinear_devoxelize
+from superdec.functional.voxelization import avg_voxelize
