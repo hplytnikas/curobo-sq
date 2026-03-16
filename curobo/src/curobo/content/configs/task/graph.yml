@@ -45,7 +45,7 @@ graph:
 
   c_max: 1.25
   use_bias_node: True
-  compute_metrics: False
+  compute_metrics: True
   interpolation_steps: 1000
   interpolation_type: "linear"
   seed: 0

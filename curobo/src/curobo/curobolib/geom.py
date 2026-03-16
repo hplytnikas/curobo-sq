@@ -706,8 +706,8 @@ class SdfSphereSuperquadric(torch.autograd.Function):
     ):
         if not hasattr(geom_cu, "closest_point_superquadric"):
             raise RuntimeError(
-                "geom_cu was built without superquadric support. Build with OpenGJK sources "
-                "available (openGJK/gpu)."
+                "geom_cu was built without superquadric support. "
+                "Rebuild the package to include superquadric_radial_distance_kernel.cu."
             )
 
         # Guard against stale or mismatched collision buffers from long-lived planner state.

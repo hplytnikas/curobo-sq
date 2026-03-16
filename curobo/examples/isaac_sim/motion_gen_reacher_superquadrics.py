@@ -1489,8 +1489,8 @@ def _plan_worker(
                 )
                 if bool(graph_only_result.success.item()):
                     carb.log_warn(
-                        "Superquadric graph-only fallback succeeded; returning geometric path "
-                        "without trajopt refinement."
+                        "Superquadric graph-only fallback succeeded; returning collision-validated "
+                        "geometric path without trajopt refinement."
                     )
                     result = graph_only_result
             if (

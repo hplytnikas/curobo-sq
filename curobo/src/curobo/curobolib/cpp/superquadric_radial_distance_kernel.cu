@@ -166,7 +166,8 @@ void sphere_sq_min_kernel(
     float px = 0.f, py = 0.f, pz = 0.f, pr = 0.f;
     if (valid) {
         const float4 s = __ldg(reinterpret_cast<const float4*>(spheres) + gid);
-        px = s.x; py = s.y; pz = s.z; pr = fabsf(s.w);
+        if (s.w < 0.f) { out_dist[gid] = 1e10f; return; }  // disabled sphere
+        px = s.x; py = s.y; pz = s.z; pr = s.w;
     }
 
     float min_d = 1e10f;
@@ -219,7 +220,8 @@ void sphere_sq_sum_cost_kernel(
     float px = 0.f, py = 0.f, pz = 0.f, pr = 0.f;
     if (valid) {
         const float4 s = __ldg(reinterpret_cast<const float4*>(spheres) + gid);
-        px = s.x; py = s.y; pz = s.z; pr = fabsf(s.w);
+        if (s.w < 0.f) { out_cost[gid] = 0.f; return; }    // disabled sphere
+        px = s.x; py = s.y; pz = s.z; pr = s.w;
     }
 
     float total = 0.f;

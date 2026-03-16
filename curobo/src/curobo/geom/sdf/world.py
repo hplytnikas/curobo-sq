@@ -991,7 +991,7 @@ class WorldPrimitiveCollision(WorldCollision):
         if pose is None:
             log_error("Superquadric requires pose")
 
-        # OpenGJK expects a unit quaternion [qx, qy, qz, qw].
+        # Quaternion stored as [qx, qy, qz, qw] (scalar last).
         q = torch.as_tensor(
             [pose[4], pose[5], pose[6], pose[3]],
             device=self.tensor_args.device,

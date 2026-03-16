@@ -675,8 +675,10 @@ class GraphPlanBase(GraphConfig):
             #    path.interpolated_plan
             # )
             if self.compute_metrics:
-                # compute metrics on interpolated plan:
-                path.metrics = self.get_metrics(path.interpolated_plan)
+                # compute feasibility on interpolated plan (constraint_fn only — cost_fn may
+                # have an empty cost list in the safety rollout and is not needed here):
+                aug_state = self.safety_rollout_fn._get_augmented_state(path.interpolated_plan)
+                path.metrics = self.safety_rollout_fn.constraint_fn(aug_state)
 
                 path.success = torch.logical_and(path.success, torch.all(path.metrics.feasible, 1))
 

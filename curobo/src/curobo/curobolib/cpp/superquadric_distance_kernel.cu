@@ -120,6 +120,7 @@ torch::Tensor evaluate_all_query_superquadric_values(
     // d >= ||c_sphere - c_sq|| - (R_sq_outer + r_sphere), where
     // R_sq_outer = max(a1,a2,a3). This bound is cheap and prevents numeric
     // pathologies in GJK/EPA from reporting far-field penetrations.
+    // sq_param layout: [sx,sy,sz, eps1,eps2, cx,cy,cz, qx,qy,qz,qw]
     auto sq_center = sq_param.slice(0, 5, 8).view({1, 3});
     auto sq_outer_radius = torch::max(sq_param.slice(0, 0, 3)).view({1});
     auto sphere_centers = query_spheres.slice(1, 0, 3);
@@ -128,6 +129,56 @@ torch::Tensor evaluate_all_query_superquadric_values(
     auto center_distance = torch::sqrt(torch::sum(center_delta * center_delta, 1));
     auto lower_bound = center_distance - (sq_outer_radius + sphere_radii);
     raw_signed_distance = torch::maximum(raw_signed_distance, lower_bound);
+
+    // Tighter local-AABB lower bound: rotate delta to SQ local frame, then
+    // compute box distance. The SQ surface is contained within its AABB for
+    // ε≤2, so any sphere outside the AABB is definitively outside the SQ.
+    // This overrides spurious GJK penetrations for boxy (small ε) shapes.
+    {
+      // Normalise quaternion [qx,qy,qz,qw] stored at indices 8-11.
+      auto sq_q = sq_param.slice(0, 8, 12);
+      auto qn = sq_q / torch::sqrt((sq_q * sq_q).sum()).clamp_min(1e-8f);
+      // 0-dim tensors for each quaternion component.
+      auto qx_t = qn[0], qy_t = qn[1], qz_t = qn[2], qw_t = qn[3];
+
+      // Standard rotation matrix R (local→world) from unit quaternion:
+      //   R[:,0] = {1-2(y²+z²), 2(xy+wz), 2(xz-wy)}
+      //   R[:,1] = {2(xy-wz), 1-2(x²+z²), 2(yz+wx)}
+      //   R[:,2] = {2(xz+wy), 2(yz-wx), 1-2(x²+y²)}
+      // p_local = R^T * p_world, so (R^T*v)_i = R_col_i · v.
+      auto r00 = 1.f - 2.f*(qy_t*qy_t + qz_t*qz_t);
+      auto r10 = 2.f*(qx_t*qy_t + qw_t*qz_t);
+      auto r20 = 2.f*(qx_t*qz_t - qw_t*qy_t);
+      auto r01 = 2.f*(qx_t*qy_t - qw_t*qz_t);
+      auto r11 = 1.f - 2.f*(qx_t*qx_t + qz_t*qz_t);
+      auto r21 = 2.f*(qy_t*qz_t + qw_t*qx_t);
+      auto r02 = 2.f*(qx_t*qz_t + qw_t*qy_t);
+      auto r12 = 2.f*(qy_t*qz_t - qw_t*qx_t);
+      auto r22 = 1.f - 2.f*(qx_t*qx_t + qy_t*qy_t);
+
+      // center_delta is already computed as sphere_centers - sq_center [Q,3].
+      auto cdx = center_delta.select(1, 0);
+      auto cdy = center_delta.select(1, 1);
+      auto cdz = center_delta.select(1, 2);
+
+      // Apply R^T to each row of center_delta → local-frame coordinates.
+      auto lx = r00*cdx + r10*cdy + r20*cdz;
+      auto ly = r01*cdx + r11*cdy + r21*cdz;
+      auto lz = r02*cdx + r12*cdy + r22*cdz;
+
+      // AABB half-extents in local frame.
+      auto sx_t = sq_param[0], sy_t = sq_param[1], sz_t = sq_param[2];
+
+      // Per-axis excess beyond the box half-extent (clamped to ≥0).
+      auto bx = torch::clamp(lx.abs() - sx_t, 0.f);
+      auto by = torch::clamp(ly.abs() - sy_t, 0.f);
+      auto bz = torch::clamp(lz.abs() - sz_t, 0.f);
+
+      // AABB surface distance minus sphere radius → signed lower bound.
+      // Positive means the sphere is definitively outside the SQ.
+      auto lb_box = torch::sqrt(bx*bx + by*by + bz*bz) - sphere_radii;
+      raw_signed_distance = torch::maximum(raw_signed_distance, lb_box);
+    }
 
     // OpenGJK returns positive outside / negative penetration. CuRobo uses
     // positive inside / negative outside, so we negate here.
