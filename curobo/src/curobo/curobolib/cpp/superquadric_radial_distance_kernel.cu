@@ -56,6 +56,22 @@ void rotate_by_quat_inv(
     oz = vz + qw * tz + ((-qx) * ty - (-qy) * tx);
 }
 
+// Rotate vector v by quaternion q (i.e. local→world transform)
+// v' = q ⊗ v ⊗ q*
+__device__ __forceinline__
+void rotate_by_quat_fwd(
+    float vx, float vy, float vz,
+    float qw, float qx, float qy, float qz,
+    float& ox, float& oy, float& oz)
+{
+    float tx = 2.f * (qy * vz - qz * vy);
+    float ty = 2.f * (qz * vx - qx * vz);
+    float tz = 2.f * (qx * vy - qy * vx);
+    ox = vx + qw * tx + (qy * tz - qz * ty);
+    oy = vy + qw * ty + (qz * tx - qx * tz);
+    oz = vz + qw * tz + (qx * ty - qy * tx);
+}
+
 
 /* ═══════════════════════════ Core SDF ══════════════════════════════════════
  *
@@ -136,6 +152,82 @@ float sq_sdf(
     return fmaxf(sdf_approx, fmaxf(lb, lb_box));
 }
 
+/* ── sq_sdf_and_normal ───────────────────────────────────────────────────────
+ *
+ * Same as sq_sdf but also returns the world-frame unit outward normal
+ * n̂ = R_local2world * (∇F_local / ‖∇F_local‖).
+ *
+ * Used by the analytical gradient kernels to replace numerical FD.
+ * Sign convention for the returned SDF is identical to sq_sdf.
+ */
+__device__ __forceinline__
+float sq_sdf_and_normal(
+    const float px, const float py, const float pz, const float pr,
+    const SQData& sq,
+    float& nx_world, float& ny_world, float& nz_world)
+{
+    const float dx = px - sq.cx;
+    const float dy = py - sq.cy;
+    const float dz = pz - sq.cz;
+
+    float lx, ly, lz;
+    rotate_by_quat_inv(dx, dy, dz, sq.qw, sq.qx, sq.qy, sq.qz, lx, ly, lz);
+
+    const float ax = fmaxf(fabsf(lx) * __frcp_rn(sq.sx), 1e-9f);
+    const float ay = fmaxf(fabsf(ly) * __frcp_rn(sq.sy), 1e-9f);
+    const float az = fmaxf(fabsf(lz) * __frcp_rn(sq.sz), 1e-9f);
+
+    const float inv_e1  = __frcp_rn(sq.eps1);
+    const float p1      = 2.f * inv_e1;
+    const float p2      = 2.f * __frcp_rn(sq.eps2);
+    const float e_ratio = sq.eps2 * inv_e1;
+
+    const float lax  = flog_safe(ax);
+    const float lay  = flog_safe(ay);
+    const float laz  = flog_safe(az);
+    const float xt   = __expf(p2 * lax);
+    const float yt   = __expf(p2 * lay);
+    const float zt   = __expf(p1 * laz);
+    const float sum  = xt + yt;
+    const float lsum = flog_safe(sum);
+    const float F    = __expf(e_ratio * lsum) + zt;
+
+    const float sx_sign = copysignf(1.f, lx);
+    const float sy_sign = copysignf(1.f, ly);
+    const float sz_sign = copysignf(1.f, lz);
+    const float ps      = __expf((e_ratio - 1.f) * lsum);
+    const float c       = 2.f * inv_e1;
+
+    const float gx = c * __frcp_rn(sq.sx) * sx_sign * ps * __expf((p2 - 1.f) * lax);
+    const float gy = c * __frcp_rn(sq.sy) * sy_sign * ps * __expf((p2 - 1.f) * lay);
+    const float gz = c * __frcp_rn(sq.sz) * sz_sign       * __expf((p1 - 1.f) * laz);
+    const float g2 = fmaf(gx, gx, fmaf(gy, gy, gz * gz));
+
+    const float inv_g   = rsqrtf(g2 + 1e-8f);
+    const float sdf_approx = fmaf(F - 1.f, inv_g, -pr);
+
+    // Lower bounds (identical to sq_sdf)
+    const float r_outer = fmaxf(sq.sx, fmaxf(sq.sy, sq.sz));
+    const float lb      = sqrtf(fmaf(dx, dx, fmaf(dy, dy, dz * dz))) - r_outer - pr;
+    const float dx_box  = fmaxf(fabsf(lx) - sq.sx, 0.f);
+    const float dy_box  = fmaxf(fabsf(ly) - sq.sy, 0.f);
+    const float dz_box  = fmaxf(fabsf(lz) - sq.sz, 0.f);
+    const float lb_box  = sqrtf(fmaf(dx_box, dx_box, fmaf(dy_box, dy_box, dz_box * dz_box))) - pr;
+
+    // World-frame unit outward normal: rotate local ∇F/‖∇F‖ to world frame.
+    // We always use the SQ normal even when the lower-bound clamp is active;
+    // it remains a good direction for the optimizer.
+    const float lnx = gx * inv_g;
+    const float lny = gy * inv_g;
+    const float lnz = gz * inv_g;
+    rotate_by_quat_fwd(lnx, lny, lnz,
+                       sq.qw, sq.qx, sq.qy, sq.qz,
+                       nx_world, ny_world, nz_world);
+
+    return fmaxf(sdf_approx, fmaxf(lb, lb_box));
+}
+
+
 /* ═══════════════════════════ CUDA kernels ══════════════════════════════════ */
 
 static constexpr int BLOCK   = 128;   // threads per block
@@ -194,6 +286,76 @@ void sphere_sq_min_kernel(
 
     if (valid)
         out_dist[gid] = min_d;
+}
+
+/* ── Kernel A2: minimum raw distance + world-frame unit outward normal ───────
+ *
+ * Extends sphere_sq_min_kernel to also output the analytical outward normal
+ * n̂_world = R_local2world * (∇F/‖∇F‖) for the closest obstacle.
+ * Used by the analytical gradient path to replace 6 numerical FD launches.
+ *
+ * out_grad layout: float4 per sphere, xyz = world-frame normal, w = 0.
+ * Sign convention: normal points outward (away from SQ interior).
+ */
+__global__
+void sphere_sq_min_and_grad_kernel(
+    const float*  __restrict__ spheres,   // [n_spheres, 4]
+    const SQData* __restrict__ sq_arr,    // [n_obs]
+    float*        __restrict__ out_dist,  // [n_spheres]
+    float4*       __restrict__ out_grad,  // [n_spheres]  world-frame normal
+    const int     n_spheres,
+    const int     n_obs)
+{
+    __shared__ SQData sh[SQ_TILE];
+
+    const int tid    = threadIdx.x;
+    const int gid    = blockIdx.x * BLOCK + tid;
+    const bool valid = (gid < n_spheres);
+
+    float px = 0.f, py = 0.f, pz = 0.f, pr = 0.f;
+    if (valid) {
+        const float4 s = __ldg(reinterpret_cast<const float4*>(spheres) + gid);
+        if (s.w < 0.f) {
+            out_dist[gid] = 1e10f;
+            out_grad[gid] = make_float4(0.f, 0.f, 0.f, 0.f);
+            return;
+        }
+        px = s.x; py = s.y; pz = s.z; pr = s.w;
+    }
+
+    float min_d   = 1e10f;
+    float best_nx = 0.f, best_ny = 0.f, best_nz = 1.f;  // world-frame normal
+
+    for (int base = 0; base < n_obs; base += SQ_TILE) {
+        if (tid < SQ_TILE) {
+            const int load_i = base + tid;
+            if (load_i < n_obs)
+                sh[tid] = sq_arr[load_i];
+        }
+        __syncthreads();
+
+        if (valid) {
+            const int tile_end = min(SQ_TILE, n_obs - base);
+            #pragma unroll 4
+            for (int j = 0; j < tile_end; ++j) {
+                float wnx, wny, wnz;
+                const float d = sq_sdf_and_normal(px, py, pz, pr, sh[j],
+                                                  wnx, wny, wnz);
+                if (d < min_d) {
+                    min_d    = d;
+                    best_nx  = wnx;
+                    best_ny  = wny;
+                    best_nz  = wnz;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid) {
+        out_dist[gid] = min_d;
+        out_grad[gid] = make_float4(best_nx, best_ny, best_nz, 0.f);
+    }
 }
 
 /* ── Kernel B: sum of smoothed collision costs over all obstacles ────────────
@@ -255,6 +417,94 @@ void sphere_sq_sum_cost_kernel(
 
     if (valid)
         out_cost[gid] = total;
+}
+
+/* ── Kernel B2: sum-of-costs + accumulated analytical gradient ───────────────
+ *
+ * Computes both the total collision cost (same as sphere_sq_sum_cost_kernel)
+ * and its gradient w.r.t. sphere position:
+ *   ∂(Σ cost_i)/∂p = Σ cost'_i * ∂sdf_i/∂p = Σ cost'_i * (-n̂_i)
+ *
+ * out_grad accumulates: Σ cost'_i * n̂_i  (positive outward direction).
+ * The C++ wrapper negates and scales by weight.
+ *
+ * cost'(sdf) = 0          if sdf ≤ 0
+ *            = sdf/act    if 0 < sdf ≤ act_dist   (quadratic region)
+ *            = 1          if sdf > act_dist        (linear region)
+ */
+__global__
+void sphere_sq_sum_cost_and_grad_kernel(
+    const float*  __restrict__ spheres,   // [n_spheres, 4]
+    const SQData* __restrict__ sq_arr,    // [n_obs]
+    float*        __restrict__ out_cost,  // [n_spheres]  (unweighted)
+    float4*       __restrict__ out_grad,  // [n_spheres]  accumulated weighted normals
+    const int     n_spheres,
+    const int     n_obs,
+    const float   act_dist)
+{
+    __shared__ SQData sh[SQ_TILE];
+
+    const int tid    = threadIdx.x;
+    const int gid    = blockIdx.x * BLOCK + tid;
+    const bool valid = (gid < n_spheres);
+
+    float px = 0.f, py = 0.f, pz = 0.f, pr = 0.f;
+    if (valid) {
+        const float4 s = __ldg(reinterpret_cast<const float4*>(spheres) + gid);
+        if (s.w < 0.f) {
+            out_cost[gid] = 0.f;
+            out_grad[gid] = make_float4(0.f, 0.f, 0.f, 0.f);
+            return;
+        }
+        px = s.x; py = s.y; pz = s.z; pr = s.w;
+    }
+
+    float total   = 0.f;
+    float sum_gnx = 0.f, sum_gny = 0.f, sum_gnz = 0.f;
+
+    for (int base = 0; base < n_obs; base += SQ_TILE) {
+        if (tid < SQ_TILE) {
+            const int load_i = base + tid;
+            if (load_i < n_obs)
+                sh[tid] = sq_arr[load_i];
+        }
+        __syncthreads();
+
+        if (valid) {
+            const int tile_end = min(SQ_TILE, n_obs - base);
+            #pragma unroll 4
+            for (int j = 0; j < tile_end; ++j) {
+                float wnx, wny, wnz;
+                /* sdf_curobo = -raw: positive = collision */
+                const float sdf = -sq_sdf_and_normal(px, py, pz, pr, sh[j],
+                                                     wnx, wny, wnz);
+                if (sdf > 0.f) {
+                    float cost_d;
+                    if (act_dist > 0.f) {
+                        if (sdf > act_dist) {
+                            total  += sdf - 0.5f * act_dist;
+                            cost_d  = 1.f;
+                        } else {
+                            total  += (0.5f / act_dist) * sdf * sdf;
+                            cost_d  = sdf / act_dist;
+                        }
+                    } else {
+                        total  += sdf;
+                        cost_d  = 1.f;
+                    }
+                    sum_gnx += cost_d * wnx;
+                    sum_gny += cost_d * wny;
+                    sum_gnz += cost_d * wnz;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid) {
+        out_cost[gid] = total;
+        out_grad[gid] = make_float4(sum_gnx, sum_gny, sum_gnz, 0.f);
+    }
 }
 
 /* ═══════════════════════════ C++ helpers ═══════════════════════════════════ */
@@ -502,6 +752,104 @@ torch::Tensor evaluate_swept_sq(
     return agg;
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * evaluate_all_sq_grad
+ *
+ * Computes the analytical gradient of the collision cost (or ESDF) with
+ * respect to sphere positions for ONE environment.
+ *
+ * Returns a [q, 4] tensor where [:3] = ∂cost/∂p_world and [3] = 0.
+ * Off-environment spheres have gradient zero (env mask applied internally).
+ *
+ * Sign convention (matching numerical FD):
+ *   ∂cost/∂p = -wt * cost'(sdf_curobo) * n̂_world
+ *
+ * where n̂_world is the unit outward normal from sq_sdf_and_normal and
+ * sdf_curobo = -d_raw (positive inside, i.e. collision).
+ * ══════════════════════════════════════════════════════════════════════════ */
+torch::Tensor evaluate_all_sq_grad(
+    const torch::Tensor& query_spheres,   // [q, 4]  float32 contiguous
+    const torch::Tensor& sq_params,       // [nenv, maxobs, 12]
+    const torch::Tensor& enabled_mask,    // [nenv, maxobs] bool
+    const torch::Tensor& query_env_idx,   // [q] int64
+    const int   env_idx,
+    const torch::Tensor& weight,
+    const torch::Tensor& act_dist,
+    const bool  sum_collisions,
+    const bool  compute_esdf,
+    cudaStream_t stream)
+{
+    const int64_t q   = query_spheres.size(0);
+    const auto    opt = query_spheres.options().dtype(torch::kFloat);
+
+    auto grad = torch::zeros({q, 4}, opt);
+    if (q == 0) return grad;
+
+    const int  cenv       = clamp_env(env_idx, (int)sq_params.size(0));
+    const auto env_mask_f = (query_env_idx == (int64_t)cenv).to(opt.dtype());
+
+    const auto sq_packed = pack_env_sq(sq_params, enabled_mask, cenv);
+    const int  n_obs     = (int)sq_packed.size(0);
+    if (n_obs == 0) return grad;
+
+    const int    blocks = ((int)q + BLOCK - 1) / BLOCK;
+    const auto*  sq_ptr = reinterpret_cast<const SQData*>(sq_packed.data_ptr<float>());
+    const float* sp     = query_spheres.data_ptr<float>();
+
+    const float ad = act_dist.numel() > 0
+                     ? act_dist.flatten().select(0, 0).item<float>() : 0.f;
+    const float wt = weight.numel() > 0
+                     ? weight.flatten().select(0, 0).item<float>()   : 1.f;
+
+    auto raw_dist = torch::empty({q}, opt);
+    auto raw_grad = torch::empty({q, 4}, opt);   // float4-aligned via .contiguous()
+
+    if (sum_collisions && !compute_esdf) {
+        /* ── Sum path: accumulate Σ cost'_i * n̂_i ─────────────────────── */
+        sphere_sq_sum_cost_and_grad_kernel<<<blocks, BLOCK, 0, stream>>>(
+            sp, sq_ptr,
+            raw_dist.data_ptr<float>(),
+            reinterpret_cast<float4*>(raw_grad.data_ptr<float>()),
+            (int)q, n_obs, ad);
+
+        /* ∂cost/∂p = -wt * Σ cost'_i * n̂_i  (kernel stores positive sum) */
+        grad = (-wt) * raw_grad * env_mask_f.unsqueeze(1);
+    } else {
+        /* ── Min-distance path ──────────────────────────────────────────── */
+        sphere_sq_min_and_grad_kernel<<<blocks, BLOCK, 0, stream>>>(
+            sp, sq_ptr,
+            raw_dist.data_ptr<float>(),
+            reinterpret_cast<float4*>(raw_grad.data_ptr<float>()),
+            (int)q, n_obs);
+
+        /* sdf_curobo = -raw_dist  (positive = collision) */
+        const auto sdf_curobo = -raw_dist;
+
+        torch::Tensor cost_d;
+        if (compute_esdf) {
+            /* ESDF: ∂sdf_curobo/∂p = -n̂  → gradient = -n̂ (no weight) */
+            cost_d = torch::ones({q}, opt);
+        } else if (ad > 0.f) {
+            /* Quadratic–linear cost derivative */
+            const auto pos = torch::relu(sdf_curobo);
+            const auto lin = torch::ones_like(pos);
+            const auto qua = pos * (1.f / ad);
+            cost_d = torch::where(pos > ad, lin, qua);
+            cost_d = torch::where(sdf_curobo > 0.f, cost_d,
+                                  torch::zeros_like(cost_d));
+        } else {
+            /* No activation: cost = relu(sdf), cost' = (sdf > 0) */
+            cost_d = (sdf_curobo > 0.f).to(opt.dtype());
+        }
+
+        /* ∂cost/∂p = -wt * cost'(sdf) * n̂_world */
+        const auto scale = (-wt) * cost_d;
+        grad = raw_grad * scale.unsqueeze(1) * env_mask_f.unsqueeze(1);
+    }
+
+    return grad;
+}
+
 } // anonymous namespace
 
 /* ═════════════════════ Legacy ABI compatibility ═══════════════════════════
@@ -664,33 +1012,16 @@ sphere_superquadric_clpt(
         else
             dist_flat = dist_flat + ev;
 
-        /* ── Numerical gradient (central finite differences) ──────────
+        /* ── Analytical gradient: n̂ = ∇F/‖∇F‖ rotated to world frame ──
          *
-         * NOTE: 6 extra kernel launches per gradient call.  Analytical
-         * gradients of the SDF approximation are tractable and would be
-         * significantly faster — left as a future improvement.
+         * Replaces the previous 6-launch numerical FD path.
+         * evaluate_all_sq_grad returns ∂cost/∂p with the env mask applied.
          */
         if (sphere_position.requires_grad()) {
-            constexpr float eps = 1e-3f;
-            auto eg = torch::zeros({T, 4}, fo);
-
-            for (int ax = 0; ax < 3; ++ax) {
-                auto qp = sph_flat.clone(); qp.select(1, ax).add_(eps);
-                auto qm = sph_flat.clone(); qm.select(1, ax).sub_(eps);
-
-                const auto vp = evaluate_all_sq(
-                    qp, sq_p, en_mask, q_env, e,
-                    wt_s, ad_s, sum_collisions, compute_esdf, stream);
-                const auto vm = evaluate_all_sq(
-                    qm, sq_p, en_mask, q_env, e,
-                    wt_s, ad_s, sum_collisions, compute_esdf, stream);
-
-                eg.select(1, ax).copy_((vp - vm) * (0.5f / eps));
-            }
-            eg.select(1, 3).zero_();
-
-            const auto emask_f = (q_env == (int64_t)e).to(fo).unsqueeze(1);
-            grad_flat = grad_flat + eg * emask_f;
+            const auto eg = evaluate_all_sq_grad(
+                sph_flat, sq_p, en_mask, q_env, e,
+                wt_s, ad_s, sum_collisions, compute_esdf, stream);
+            grad_flat = grad_flat + eg;
         }
     }
 
