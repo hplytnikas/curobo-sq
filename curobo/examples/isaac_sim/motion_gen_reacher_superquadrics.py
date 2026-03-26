@@ -422,7 +422,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--sdf_bbox_dims",
         nargs=3,
         type=float,
-        default=[1.0, 1.0, 0.9],
+        default=[1.6, 1.6, 1.2],
         metavar=("dx", "dy", "dz"),
         help="Dimensions of ESDF sampling bounding box in meters.",
     )
@@ -455,6 +455,48 @@ def build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=30,
         help="Update ESDF visualization every N simulation steps.",
+    )
+    parser.add_argument(
+        "--visualize_sdf_gradients",
+        action="store_true",
+        default=False,
+        help="Visualize ESDF gradient vectors (normals) in Isaac Sim.",
+    )
+    parser.add_argument(
+        "--sdf_gradient_max_vectors",
+        type=int,
+        default=400,
+        help="Maximum number of SDF gradient vectors drawn per update.",
+    )
+    parser.add_argument(
+        "--sdf_gradient_scale",
+        type=float,
+        default=0.08,
+        help="Scale factor for rendered SDF gradient vector lengths.",
+    )
+    parser.add_argument(
+        "--sdf_gradient_line_width",
+        type=float,
+        default=0.0025,
+        help="Rendered line width for SDF gradient vectors.",
+    )
+    parser.add_argument(
+        "--sdf_gradient_tip_size",
+        type=float,
+        default=0.02,
+        help="Rendered size for gradient tip point markers.",
+    )
+    parser.add_argument(
+        "--sdf_gradient_shaft_point_size",
+        type=float,
+        default=0.01,
+        help="Rendered size for gradient shaft point markers.",
+    )
+    parser.add_argument(
+        "--sdf_gradient_shaft_points",
+        type=int,
+        default=6,
+        help="Number of point samples used to draw each gradient arrow shaft.",
     )
     # ── Headless / automated debugging ──────────────────────────────────────
     parser.add_argument(
@@ -585,6 +627,317 @@ def update_sdf_points_prim(points_prim, motion_gen) -> None:
     points_prim.GetDisplayColorPrimvar().Set(cols)
 
 
+def _sdf_gradient_color(magnitude: float, max_magnitude: float):
+    """Map gradient magnitude to RGB color (cyan=small, yellow=large)."""
+    mmax = max(float(max_magnitude), 1.0e-6)
+    t = float(np.clip(magnitude / mmax, 0.0, 1.0))
+    return (0.0 + 0.9 * t, 0.8 + 0.2 * t, 1.0 - 0.8 * t)
+
+
+def create_sdf_gradient_prim(stage):
+    """Create a USD BasisCurves prim used for SDF gradient visualization."""
+    from pxr import UsdGeom
+
+    curves = UsdGeom.BasisCurves.Define(stage, "/curobo/sdf_gradient_vectors")
+    curves.CreateTypeAttr().Set(UsdGeom.Tokens.linear)
+    curves.CreateCurveVertexCountsAttr().Set([])
+    curves.CreatePointsAttr().Set([])
+    curves.CreateWidthsAttr().Set([])
+    color_primvar = curves.CreateDisplayColorPrimvar(UsdGeom.Tokens.vertex)
+    color_primvar.SetInterpolation(UsdGeom.Tokens.vertex)
+    color_primvar.Set([])
+    return curves
+
+
+def create_sdf_gradient_tip_prim(stage):
+    """Create a USD points prim used as a fallback for gradient tip visualization."""
+    from pxr import UsdGeom
+
+    points = UsdGeom.Points.Define(stage, "/curobo/sdf_gradient_tips")
+    points.CreatePointsAttr().Set([])
+    points.CreateWidthsAttr().Set([])
+    color_primvar = points.CreateDisplayColorPrimvar(UsdGeom.Tokens.vertex)
+    color_primvar.SetInterpolation(UsdGeom.Tokens.vertex)
+    color_primvar.Set([])
+    return points
+
+
+def create_sdf_gradient_shaft_prim(stage):
+    """Create a USD points prim used to render gradient arrow shafts as point chains."""
+    from pxr import UsdGeom
+
+    points = UsdGeom.Points.Define(stage, "/curobo/sdf_gradient_shafts")
+    points.CreatePointsAttr().Set([])
+    points.CreateWidthsAttr().Set([])
+    color_primvar = points.CreateDisplayColorPrimvar(UsdGeom.Tokens.vertex)
+    color_primvar.SetInterpolation(UsdGeom.Tokens.vertex)
+    color_primvar.Set([])
+    return points
+
+
+def update_sdf_gradient_prim(
+    gradient_prim,
+    motion_gen,
+    gradient_tip_prim=None,
+    gradient_shaft_prim=None,
+) -> None:
+    """Update ESDF gradient vectors in a bounding box around the robot workspace."""
+    from pxr import Gf, Vt
+
+    bbox_dims = [max(float(x), 1.0e-3) for x in args.sdf_bbox_dims]
+    voxel_size = max(float(args.sdf_voxel_size), 1.0e-3)
+    sdf_band = max(float(args.sdf_band), 1.0e-6)
+    max_vectors = max(int(args.sdf_gradient_max_vectors), 1)
+    vec_scale = max(float(args.sdf_gradient_scale), 1.0e-6)
+    line_width = max(float(args.sdf_gradient_line_width), 1.0e-5)
+
+    query_box = Cuboid(
+        name="sdf_gradient_box",
+        pose=list(args.sdf_bbox_center) + [1.0, 0.0, 0.0, 0.0],
+        dims=bbox_dims,
+    )
+    voxel_grid = motion_gen.world_coll_checker.get_esdf_in_bounding_box(
+        cuboid=query_box,
+        voxel_size=voxel_size,
+        dtype=torch.float32,
+    )
+
+    xyz = voxel_grid.xyzr_tensor[:, :3]
+    sdf = voxel_grid.feature_tensor
+    valid = torch.isfinite(sdf)
+    near_surface = sdf >= -sdf_band
+    keep = torch.logical_and(valid, near_surface)
+    total_voxels = int(xyz.shape[0])
+    kept_voxels = int(torch.count_nonzero(keep).item())
+
+    if kept_voxels > 0:
+        sdf_kept = sdf[keep]
+        sdf_min = float(torch.min(sdf_kept).item())
+        sdf_max = float(torch.max(sdf_kept).item())
+        sdf_mean = float(torch.mean(sdf_kept).item())
+    else:
+        sdf_min = float("nan")
+        sdf_max = float("nan")
+        sdf_mean = float("nan")
+
+    # print(
+    #     "[sdf-grad] "
+    #     f"voxels_total={total_voxels} near_surface={kept_voxels} "
+    #     f"sdf[min/mean/max]=({sdf_min:.4f}/{sdf_mean:.4f}/{sdf_max:.4f}) "
+    #     f"band={sdf_band:.4f}",
+    #     flush=True,
+    # )
+
+    if int(torch.count_nonzero(keep).item()) == 0:
+        gradient_prim.GetCurveVertexCountsAttr().Set(Vt.IntArray())
+        gradient_prim.GetPointsAttr().Set(Vt.Vec3fArray())
+        gradient_prim.GetWidthsAttr().Set(Vt.FloatArray())
+        gradient_prim.GetDisplayColorPrimvar().Set(Vt.Vec3fArray())
+        if gradient_tip_prim is not None:
+            gradient_tip_prim.GetPointsAttr().Set(Vt.Vec3fArray())
+            gradient_tip_prim.GetWidthsAttr().Set(Vt.FloatArray())
+            gradient_tip_prim.GetDisplayColorPrimvar().Set(Vt.Vec3fArray())
+        if gradient_shaft_prim is not None:
+            gradient_shaft_prim.GetPointsAttr().Set(Vt.Vec3fArray())
+            gradient_shaft_prim.GetWidthsAttr().Set(Vt.FloatArray())
+            gradient_shaft_prim.GetDisplayColorPrimvar().Set(Vt.Vec3fArray())
+        return
+
+    xyz = xyz[keep]
+    sdf = sdf[keep]
+
+    if xyz.shape[0] > max_vectors:
+        sample_idx = torch.linspace(
+            0,
+            xyz.shape[0] - 1,
+            steps=max_vectors,
+            device=xyz.device,
+            dtype=torch.float32,
+        ).round().to(dtype=torch.long)
+        xyz = xyz.index_select(0, sample_idx)
+        sdf = sdf.index_select(0, sample_idx)
+
+    device = xyz.device
+    query = torch.zeros((xyz.shape[0], 1, 1, 4), dtype=torch.float32, device=device)
+    query[:, 0, 0, :3] = xyz
+    query.requires_grad_(True)
+
+    coll_buffer = CollisionQueryBuffer()
+    coll_buffer.update_buffer_shape(
+        query.shape,
+        motion_gen.world_coll_checker.tensor_args,
+        motion_gen.world_coll_checker.collision_types,
+    )
+    weight = motion_gen.world_coll_checker.tensor_args.to_device([1.0])
+
+    dist = motion_gen.world_coll_checker.get_sphere_distance(
+        query,
+        coll_buffer,
+        weight,
+        motion_gen.world_coll_checker.max_distance,
+        sum_collisions=False,
+        compute_esdf=True,
+    )
+    grad_vec = None
+
+    # Preferred path: use collision buffer gradients produced by collision kernels.
+    try:
+        grad_buffer = coll_buffer.get_gradient_buffer()
+        if grad_buffer is not None:
+            candidate = grad_buffer[:, 0, 0, :3]
+            if torch.count_nonzero(torch.isfinite(candidate)).item() > 0:
+                grad_vec = candidate.detach()
+    except Exception:
+        grad_vec = None
+
+    # Fallback path: autograd from ESDF scalar field.
+    if grad_vec is None:
+        grad = torch.autograd.grad(
+            outputs=dist.sum(),
+            inputs=query,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=True,
+        )[0]
+        if grad is not None:
+            grad_vec = grad[:, 0, 0, :3].detach()
+
+    if grad_vec is None:
+        gradient_prim.GetCurveVertexCountsAttr().Set(Vt.IntArray())
+        gradient_prim.GetPointsAttr().Set(Vt.Vec3fArray())
+        gradient_prim.GetWidthsAttr().Set(Vt.FloatArray())
+        gradient_prim.GetDisplayColorPrimvar().Set(Vt.Vec3fArray())
+        if gradient_tip_prim is not None:
+            gradient_tip_prim.GetPointsAttr().Set(Vt.Vec3fArray())
+            gradient_tip_prim.GetWidthsAttr().Set(Vt.FloatArray())
+            gradient_tip_prim.GetDisplayColorPrimvar().Set(Vt.Vec3fArray())
+        if gradient_shaft_prim is not None:
+            gradient_shaft_prim.GetPointsAttr().Set(Vt.Vec3fArray())
+            gradient_shaft_prim.GetWidthsAttr().Set(Vt.FloatArray())
+            gradient_shaft_prim.GetDisplayColorPrimvar().Set(Vt.Vec3fArray())
+        carb.log_warn("SDF gradient visualization: no gradients available for sampled ESDF points.")
+        return
+
+    grad_mag = torch.linalg.vector_norm(grad_vec, ord=2, dim=1)
+    finite_grad = torch.isfinite(grad_mag)
+    non_zero = grad_mag > 1.0e-8
+    keep_grad = torch.logical_and(finite_grad, non_zero)
+    finite_count = int(torch.count_nonzero(finite_grad).item())
+    non_zero_count = int(torch.count_nonzero(non_zero).item())
+    keep_grad_count = int(torch.count_nonzero(keep_grad).item())
+
+    if finite_count > 0:
+        finite_vals = grad_mag[finite_grad]
+        gmin = float(torch.min(finite_vals).item())
+        gmax = float(torch.max(finite_vals).item())
+        gmean = float(torch.mean(finite_vals).item())
+    else:
+        gmin = float("nan")
+        gmax = float("nan")
+        gmean = float("nan")
+
+    # print(
+    #     "[sdf-grad] "
+    #     f"gradients finite={finite_count} non_zero={non_zero_count} rendered={keep_grad_count} "
+    #     f"|g|[min/mean/max]=({gmin:.4e}/{gmean:.4e}/{gmax:.4e})",
+    #     flush=True,
+    # )
+
+    if int(torch.count_nonzero(keep_grad).item()) == 0:
+        gradient_prim.GetCurveVertexCountsAttr().Set(Vt.IntArray())
+        gradient_prim.GetPointsAttr().Set(Vt.Vec3fArray())
+        gradient_prim.GetWidthsAttr().Set(Vt.FloatArray())
+        gradient_prim.GetDisplayColorPrimvar().Set(Vt.Vec3fArray())
+        if gradient_tip_prim is not None:
+            gradient_tip_prim.GetPointsAttr().Set(Vt.Vec3fArray())
+            gradient_tip_prim.GetWidthsAttr().Set(Vt.FloatArray())
+            gradient_tip_prim.GetDisplayColorPrimvar().Set(Vt.Vec3fArray())
+        if gradient_shaft_prim is not None:
+            gradient_shaft_prim.GetPointsAttr().Set(Vt.Vec3fArray())
+            gradient_shaft_prim.GetWidthsAttr().Set(Vt.FloatArray())
+            gradient_shaft_prim.GetDisplayColorPrimvar().Set(Vt.Vec3fArray())
+        # print("[sdf-grad] no renderable gradient vectors after filtering", flush=True)
+        return
+
+    xyz = xyz[keep_grad].detach().cpu().numpy()
+    grad_vec = grad_vec[keep_grad].cpu().numpy()
+    grad_mag = grad_mag[keep_grad].cpu().numpy()
+    max_mag = float(np.max(grad_mag)) if grad_mag.size > 0 else 1.0
+
+    grad_dir = grad_vec / np.maximum(grad_mag[:, None], 1.0e-8)
+    # ESDF returned here is positive inside obstacles and negative outside;
+    # use -grad to point toward increasing free space.
+    grad_dir = -grad_dir
+    grad_norm = grad_mag / max(max_mag, 1.0e-8)
+    # Keep a visible minimum vector length so near-flat regions are still rendered.
+    vec_len = vec_scale * (0.25 + 0.75 * grad_norm)
+    endpoints = xyz + grad_dir * vec_len[:, None]
+
+    preview_n = min(3, xyz.shape[0])
+    # for i in range(preview_n):
+    #     print(
+    #         "[sdf-grad] "
+    #         f"sample[{i}] p=({xyz[i][0]:.3f},{xyz[i][1]:.3f},{xyz[i][2]:.3f}) "
+    #         f"g=({grad_vec[i][0]:.3e},{grad_vec[i][1]:.3e},{grad_vec[i][2]:.3e}) "
+    #         f"|g|={grad_mag[i]:.3e} len={vec_len[i]:.3e}",
+    #         flush=True,
+    #     )
+
+    points = []
+    colors = []
+    curve_counts = []
+    widths = []
+    for i in range(xyz.shape[0]):
+        p0 = xyz[i]
+        p1 = endpoints[i]
+        color = _sdf_gradient_color(float(grad_mag[i]), max_mag)
+
+        points.append(Gf.Vec3f(float(p0[0]), float(p0[1]), float(p0[2])))
+        points.append(Gf.Vec3f(float(p1[0]), float(p1[1]), float(p1[2])))
+        colors.append(Gf.Vec3f(*color))
+        colors.append(Gf.Vec3f(*color))
+        curve_counts.append(2)
+        widths.append(line_width)
+
+    gradient_prim.GetCurveVertexCountsAttr().Set(Vt.IntArray(curve_counts))
+    gradient_prim.GetPointsAttr().Set(Vt.Vec3fArray(points))
+    gradient_prim.GetWidthsAttr().Set(Vt.FloatArray(widths))
+    gradient_prim.GetDisplayColorPrimvar().Set(Vt.Vec3fArray(colors))
+
+    if gradient_tip_prim is not None:
+        tip_points = [Gf.Vec3f(float(p[0]), float(p[1]), float(p[2])) for p in endpoints]
+        tip_colors = [Gf.Vec3f(0.0, 1.0, 0.2) for _ in endpoints]
+        tip_max_size = float(max(args.sdf_gradient_tip_size, 1.0e-4))
+        tip_min_size = 0.2 * tip_max_size
+        tip_widths = [
+            float(tip_min_size + (tip_max_size - tip_min_size) * float(gn))
+            for gn in grad_norm
+        ]
+        gradient_tip_prim.GetPointsAttr().Set(Vt.Vec3fArray(tip_points))
+        gradient_tip_prim.GetWidthsAttr().Set(Vt.FloatArray(tip_widths))
+        gradient_tip_prim.GetDisplayColorPrimvar().Set(Vt.Vec3fArray(tip_colors))
+
+    if gradient_shaft_prim is not None:
+        shaft_pts = []
+        shaft_cols = []
+        shaft_w = []
+        shaft_point_count = max(int(args.sdf_gradient_shaft_points), 2)
+        shaft_size = float(max(args.sdf_gradient_shaft_point_size, 1.0e-4))
+        for i in range(xyz.shape[0]):
+            color = _sdf_gradient_color(float(grad_mag[i]), max_mag)
+            p0 = xyz[i]
+            p1 = endpoints[i]
+            for k in range(shaft_point_count):
+                t = k / float(shaft_point_count - 1)
+                pp = p0 * (1.0 - t) + p1 * t
+                shaft_pts.append(Gf.Vec3f(float(pp[0]), float(pp[1]), float(pp[2])))
+                shaft_cols.append(Gf.Vec3f(*color))
+                shaft_w.append(shaft_size)
+        gradient_shaft_prim.GetPointsAttr().Set(Vt.Vec3fArray(shaft_pts))
+        gradient_shaft_prim.GetWidthsAttr().Set(Vt.FloatArray(shaft_w))
+        gradient_shaft_prim.GetDisplayColorPrimvar().Set(Vt.Vec3fArray(shaft_cols))
+
+
 def quat_geodesic_distance_degrees(q_a, q_b) -> float:
     """Return shortest-angle quaternion distance in degrees."""
     q_a = np.asarray(q_a, dtype=np.float64)
@@ -604,6 +957,71 @@ def _safe_float(value, default: float = float("nan")) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _format_grad_tensor_stats(name: str, tensor: torch.Tensor) -> str:
+    """Return concise gradient magnitude statistics for a tensor."""
+    t = tensor.detach()
+    if t.numel() == 0:
+        return f"{name}: empty"
+
+    t_f = t.to(dtype=torch.float32)
+    flat = t_f.reshape(-1)
+    abs_max = float(torch.max(torch.abs(flat)).item())
+
+    if t_f.ndim == 0:
+        l2_mean = float(torch.abs(t_f).item())
+        l2_max = l2_mean
+    elif t_f.shape[-1] > 1:
+        vec = t_f.reshape(-1, t_f.shape[-1])
+        l2 = torch.linalg.vector_norm(vec, ord=2, dim=1)
+        l2_mean = float(torch.mean(l2).item())
+        l2_max = float(torch.max(l2).item())
+    else:
+        l2 = torch.abs(flat)
+        l2_mean = float(torch.mean(l2).item())
+        l2_max = float(torch.max(l2).item())
+
+    return (
+        f"{name}: shape={tuple(t.shape)} "
+        f"l2_mean={l2_mean:.3e} l2_max={l2_max:.3e} abs_max={abs_max:.3e}"
+    )
+
+
+def _log_gradient_magnitudes(plan_id: int, label: str, payload) -> None:
+    """Log gradient tensor magnitudes found in planner debug payloads."""
+    grad_summaries = []
+
+    def add_summary(name: str, value) -> None:
+        if isinstance(value, torch.Tensor):
+            grad_summaries.append(_format_grad_tensor_stats(name, value))
+        elif isinstance(value, (list, tuple)):
+            for idx, item in enumerate(value):
+                if isinstance(item, torch.Tensor):
+                    grad_summaries.append(_format_grad_tensor_stats(f"{name}[{idx}]", item))
+
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if "grad" in str(key).lower():
+                add_summary(str(key), value)
+
+    for attr in dir(payload):
+        if attr.startswith("_") or "grad" not in attr.lower():
+            continue
+        try:
+            value = getattr(payload, attr)
+        except Exception:
+            continue
+        if callable(value):
+            continue
+        add_summary(attr, value)
+
+    if not grad_summaries:
+        carb.log_warn(f"plan#{plan_id} {label} gradient magnitudes: unavailable")
+        return
+
+    for summary in grad_summaries:
+        carb.log_warn(f"plan#{plan_id} {label} gradient magnitudes {summary}")
 
 
 def _format_plan_status(status, success: bool | None = None) -> str:
@@ -697,6 +1115,7 @@ def log_plan_failure_diagnostics(
     ik_result = debug_info.get("ik_result") if isinstance(debug_info, dict) else None
     if ik_result is not None:
         try:
+            _log_gradient_magnitudes(plan_id, "ik", ik_result)
             success_count = int(torch.count_nonzero(ik_result.success).item())
             total_count = int(ik_result.success.numel())
             min_pos_err = float(torch.min(ik_result.position_error).item())
@@ -734,6 +1153,7 @@ def log_plan_failure_diagnostics(
     trajopt_result = debug_info.get("trajopt_result") if isinstance(debug_info, dict) else None
     if trajopt_result is not None:
         try:
+            _log_gradient_magnitudes(plan_id, "trajopt", trajopt_result)
             traj_success_count = int(torch.count_nonzero(trajopt_result.success).item())
             traj_total_count = int(trajopt_result.success.numel())
             traj_msg = (
@@ -799,7 +1219,7 @@ from omni.isaac.core.objects import cuboid, sphere
 from omni.isaac.core.utils.types import ArticulationAction
 
 from curobo.curobolib.geom import geom_cu
-from curobo.geom.sdf.world import CollisionCheckerType
+from curobo.geom.sdf.world import CollisionCheckerType, CollisionQueryBuffer
 from curobo.geom.types import Cuboid, Mesh, Superquadric, WorldConfig
 from curobo.types.base import TensorDeviceType
 from curobo.types.math import Pose
@@ -1176,17 +1596,17 @@ def build_collision_and_visual_worlds() -> tuple[WorldConfig, WorldConfig, World
         build_superquadric_mesh(obstacle, args.surface_resolution)
         for obstacle in superquadric_world.superquadric
     ]
-    visual_world = WorldConfig(cuboid=table_world.cuboid, mesh=mesh_obstacles)
+    visual_world = WorldConfig(cuboid=[], mesh=mesh_obstacles)
 
     collision_superquadric_world = apply_superquadric_collision_tolerance(superquadric_world)
 
     if args.world_representation == "superquadrics":
         collision_world = WorldConfig(
-            cuboid=table_world.cuboid,
+            cuboid=[],
             superquadric=collision_superquadric_world.superquadric,
         )
     else:
-        collision_world = WorldConfig(cuboid=table_world.cuboid, mesh=mesh_obstacles)
+        collision_world = WorldConfig(cuboid=[], mesh=mesh_obstacles)
 
     print(
         "Loaded",
@@ -1232,7 +1652,7 @@ def build_motion_gen(robot_cfg, collision_world: WorldConfig, tensor_args: Tenso
     memory_profile = args.planner_memory_profile
     if memory_profile == "auto":
         if has_superquadrics and interactive_mode:
-            memory_profile = "low"
+            memory_profile = "balanced"   # was "low"; balanced gives 2x seeds vs low
         else:
             memory_profile = "quality"
 
@@ -1244,11 +1664,10 @@ def build_motion_gen(robot_cfg, collision_world: WorldConfig, tensor_args: Tenso
     if has_superquadrics:
         collision_cache["superquadric"] = len(collision_world.superquadric)
 
-    # With no graph planner (superquadrics), fewer seeds converge faster and
-    # reduce per-frame GPU load during interactive planning.
-    num_trajopt_seeds = 4 if has_superquadrics else 12
-    num_ik_seeds = 8 if has_superquadrics else 32
-    num_batch_ik_seeds = 8 if has_superquadrics else 32
+    # Superquadric trajopt benefits from more seeds; balanced profile caps to 2/4 of these.
+    num_trajopt_seeds = 8 if has_superquadrics else 12
+    num_ik_seeds = 16 if has_superquadrics else 32
+    num_batch_ik_seeds = 16 if has_superquadrics else 32
     interpolation_steps = 5000
     evaluate_interpolated_trajectory = True
 
@@ -1324,7 +1743,9 @@ def build_motion_gen(robot_cfg, collision_world: WorldConfig, tensor_args: Tenso
     # the IK and trajopt particle optimisers (particle_opt_base._initialize_cuda_graph).
     # Setting use_cuda_graph=False disables graph capture across all solvers so
     # the superquadric kernel is called eagerly rather than inside a CUDA graph.
+    
     use_cuda_graph = not has_superquadrics
+    # use_cuda_graph = True
 
     motion_gen_config = MotionGenConfig.load_from_robot_config(
         robot_cfg,
@@ -1928,18 +2349,9 @@ def main() -> None:
                 "in interactive mode for stability."
             )
             effective_plan_cooldown_steps = 45
-        if effective_plan_timeout is not None and effective_plan_timeout > 2.0:
-            carb.log_warn(
-                f"Capping --plan_timeout from {effective_plan_timeout:.2f}s to 2.00s "
-                "in interactive mode for stability."
-            )
-            effective_plan_timeout = 2.0
+        # No timeout cap — allow long runs for convergence investigation.
+        # (Previously capped at 5s for SQs / 2s for mesh in interactive mode.)
         cmd_substeps = 0
-        if has_superquadrics and enable_finetune_trajopt:
-            carb.log_warn(
-                "Disabling finetune trajopt in interactive superquadric mode to reduce peak GPU memory."
-            )
-            enable_finetune_trajopt = False
 
     enable_superquadric_graph = (
         has_superquadrics and (not args.disable_superquadric_graph) and (not args.trajopt_only)
@@ -1950,7 +2362,7 @@ def main() -> None:
         max_attempts=max_attempts,
         timeout=effective_plan_timeout,
         enable_finetune_trajopt=enable_finetune_trajopt,
-        time_dilation_factor=1.0 if (args.reactive or has_superquadrics) else 0.5,
+        time_dilation_factor=0.5,
         check_start_validity=not has_superquadrics,
     )
 
@@ -2025,6 +2437,9 @@ def main() -> None:
     last_heartbeat_time = 0.0
     force_plan_request = False
     sdf_points_prim = None
+    sdf_gradient_prim = None
+    sdf_gradient_tip_prim = None
+    sdf_gradient_shaft_prim = None
     last_sdf_update_step = -10_000_000
 
     my_world.scene.add_default_ground_plane()
@@ -2034,6 +2449,13 @@ def main() -> None:
         carb.log_warn(
             "SDF visualization enabled. Red points are inside obstacles, blue points are outside "
             "(within configured band)."
+        )
+    if args.visualize_sdf_gradients:
+        sdf_gradient_prim = create_sdf_gradient_prim(stage)
+        sdf_gradient_tip_prim = create_sdf_gradient_tip_prim(stage)
+        sdf_gradient_shaft_prim = create_sdf_gradient_shaft_prim(stage)
+        carb.log_warn(
+            "SDF gradient visualization enabled. Arrows are rendered as shaft points + green tips."
         )
 
     # Parse automatic cube target positions (headless testing / debugging).
@@ -2096,15 +2518,22 @@ def main() -> None:
                     flush=True,
                 )
 
-        if (
-            args.visualize_sdf
-            and sdf_points_prim is not None
-            and (step_index - last_sdf_update_step) >= max(args.sdf_update_steps, 1)
-        ):
-            try:
-                update_sdf_points_prim(sdf_points_prim, motion_gen)
-            except Exception as exc:
-                carb.log_warn(f"Failed to update SDF visualization: {exc}")
+        if (step_index - last_sdf_update_step) >= max(args.sdf_update_steps, 1):
+            if args.visualize_sdf and sdf_points_prim is not None:
+                try:
+                    update_sdf_points_prim(sdf_points_prim, motion_gen)
+                except Exception as exc:
+                    carb.log_warn(f"Failed to update SDF visualization: {exc}")
+            if args.visualize_sdf_gradients and sdf_gradient_prim is not None:
+                try:
+                    update_sdf_gradient_prim(
+                        sdf_gradient_prim,
+                        motion_gen,
+                        sdf_gradient_tip_prim,
+                        sdf_gradient_shaft_prim,
+                    )
+                except Exception as exc:
+                    carb.log_warn(f"Failed to update SDF gradient visualization: {exc}")
             last_sdf_update_step = step_index
 
         cube_position, cube_orientation = target.get_world_pose()

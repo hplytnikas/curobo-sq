@@ -3364,13 +3364,14 @@ class MotionGen(MotionGenConfig):
 
                 result.used_graph = True
                 if plan_config.enable_opt:
+                    # position holds ALL graph seeds; filter to successful ones.
+                    _n_plans = result.graph_plan.position.numel() // (
+                        interpolation_steps * self._dof
+                    )
                     trajopt_seed = (
-                        result.graph_plan.position.view(
-                            1,  # solve_state.batch_size,
-                            graph_success,  # solve_state.num_trajopt_seeds,
-                            interpolation_steps,
-                            self._dof,
-                        )
+                        result.graph_plan.position
+                        .view(_n_plans, interpolation_steps, self._dof)[graph_result.success]
+                        .view(1, graph_success, interpolation_steps, self._dof)
                         .transpose(0, 1)
                         .contiguous()
                     )
@@ -3649,13 +3650,14 @@ class MotionGen(MotionGenConfig):
 
                 result.used_graph = True
                 if plan_config.enable_opt:
+                    # position holds ALL graph seeds; filter to successful ones.
+                    _n_plans = result.graph_plan.position.numel() // (
+                        interpolation_steps * self._dof
+                    )
                     trajopt_seed = (
-                        result.graph_plan.position.view(
-                            1,  # solve_state.batch_size,
-                            graph_success,  # solve_state.num_trajopt_seeds,
-                            interpolation_steps,
-                            self._dof,
-                        )
+                        result.graph_plan.position
+                        .view(_n_plans, interpolation_steps, self._dof)[graph_result.success]
+                        .view(1, graph_success, interpolation_steps, self._dof)
                         .transpose(0, 1)
                         .contiguous()
                     )
@@ -3924,11 +3926,15 @@ class MotionGen(MotionGenConfig):
                 result.used_graph = True
 
                 if plan_config.enable_opt:
-                    trajopt_seed = result.graph_plan.position.view(
-                        graph_success,  # solve_state.num_trajopt_seeds,
-                        interpolation_steps,
-                        self._dof,
-                    ).contiguous()
+                    # position holds ALL graph seeds; filter to successful ones.
+                    _n_plans = result.graph_plan.position.numel() // (
+                        interpolation_steps * self._dof
+                    )
+                    trajopt_seed = (
+                        result.graph_plan.position
+                        .view(_n_plans, interpolation_steps, self._dof)[graph_result.success]
+                        .contiguous()
+                    )
                     trajopt_seed_traj = torch.zeros(
                         (1, trajopt_seed.shape[0], self.trajopt_solver.action_horizon, self._dof),
                         device=self.tensor_args.device,

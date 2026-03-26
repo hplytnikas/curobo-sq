@@ -73,10 +73,149 @@ void rotate_by_quat_fwd(
 }
 
 
+/* ═══════════════════════════ Newton radial solve ════════════════════════════
+ *
+ * For points INSIDE the SQ (F < 1), the Taubin approximation and lb_box both
+ * return a constant value of −r_sphere, giving a flat cost landscape that
+ * defeats gradient-based trajectory optimisation.
+ *
+ * Instead we use Newton iteration to find λ such that F(λ·p_local) = 1.
+ * The radial signed distance is then (1 − λ)·|p_local|, which is:
+ *   negative (inside)  when λ > 1
+ *   positive (outside) when λ < 1
+ *
+ * Iteration: λ ← λ − (F(λp) − 1) / (∇F(λp) · p),  starting from λ = 1.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* sq_newton_lambda: returns λ for the radial distance (no gradient output). */
+__device__ __forceinline__
+float sq_newton_lambda(
+    const float lx, const float ly, const float lz,
+    const SQData& sq)
+{
+    const float inv_e1  = __frcp_rn(sq.eps1);
+    const float p1      = 2.f * inv_e1;
+    const float p2      = 2.f * __frcp_rn(sq.eps2);
+    const float e_ratio = sq.eps2 * inv_e1;
+
+    float lambda = 1.f;
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float qx = lambda * lx;
+        const float qy = lambda * ly;
+        const float qz = lambda * lz;
+
+        const float ax = fmaxf(fabsf(qx) * __frcp_rn(sq.sx), 1e-9f);
+        const float ay = fmaxf(fabsf(qy) * __frcp_rn(sq.sy), 1e-9f);
+        const float az = fmaxf(fabsf(qz) * __frcp_rn(sq.sz), 1e-9f);
+
+        const float lax  = flog_safe(ax);
+        const float lay  = flog_safe(ay);
+        const float laz  = flog_safe(az);
+        const float xt   = __expf(p2 * lax);
+        const float yt   = __expf(p2 * lay);
+        const float zt   = __expf(p1 * laz);
+        const float sum  = xt + yt;
+        const float lsum = flog_safe(sum);
+        const float F    = __expf(e_ratio * lsum) + zt;
+
+        const float sx_sign = copysignf(1.f, qx);
+        const float sy_sign = copysignf(1.f, qy);
+        const float sz_sign = copysignf(1.f, qz);
+        const float ps      = __expf((e_ratio - 1.f) * lsum);
+        const float c       = 2.f * inv_e1;
+
+        const float gx = c * __frcp_rn(sq.sx) * sx_sign * ps * __expf((p2 - 1.f) * lax);
+        const float gy = c * __frcp_rn(sq.sy) * sy_sign * ps * __expf((p2 - 1.f) * lay);
+        const float gz = c * __frcp_rn(sq.sz) * sz_sign       * __expf((p1 - 1.f) * laz);
+
+        const float df = fmaf(gx, lx, fmaf(gy, ly, gz * lz));
+        lambda -= (F - 1.f) / (df + 1e-8f);
+    }
+
+    return lambda;
+}
+
+/* sq_newton_lambda_and_surf_grad: returns λ AND ∇F at the final surface point.
+ * Used by sq_sdf_and_normal so the gradient path also gets a correct normal. */
+__device__ __forceinline__
+float sq_newton_lambda_and_surf_grad(
+    const float lx, const float ly, const float lz,
+    const SQData& sq,
+    float& surf_gx, float& surf_gy, float& surf_gz)
+{
+    const float inv_e1  = __frcp_rn(sq.eps1);
+    const float p1      = 2.f * inv_e1;
+    const float p2      = 2.f * __frcp_rn(sq.eps2);
+    const float e_ratio = sq.eps2 * inv_e1;
+
+    float lambda = 1.f;
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float qx = lambda * lx;
+        const float qy = lambda * ly;
+        const float qz = lambda * lz;
+
+        const float ax = fmaxf(fabsf(qx) * __frcp_rn(sq.sx), 1e-9f);
+        const float ay = fmaxf(fabsf(qy) * __frcp_rn(sq.sy), 1e-9f);
+        const float az = fmaxf(fabsf(qz) * __frcp_rn(sq.sz), 1e-9f);
+
+        const float lax  = flog_safe(ax);
+        const float lay  = flog_safe(ay);
+        const float laz  = flog_safe(az);
+        const float xt   = __expf(p2 * lax);
+        const float yt   = __expf(p2 * lay);
+        const float zt   = __expf(p1 * laz);
+        const float sum  = xt + yt;
+        const float lsum = flog_safe(sum);
+        const float F    = __expf(e_ratio * lsum) + zt;
+
+        const float sx_sign = copysignf(1.f, qx);
+        const float sy_sign = copysignf(1.f, qy);
+        const float sz_sign = copysignf(1.f, qz);
+        const float ps      = __expf((e_ratio - 1.f) * lsum);
+        const float c       = 2.f * inv_e1;
+
+        surf_gx = c * __frcp_rn(sq.sx) * sx_sign * ps * __expf((p2 - 1.f) * lax);
+        surf_gy = c * __frcp_rn(sq.sy) * sy_sign * ps * __expf((p2 - 1.f) * lay);
+        surf_gz = c * __frcp_rn(sq.sz) * sz_sign       * __expf((p1 - 1.f) * laz);
+
+        const float df = fmaf(surf_gx, lx, fmaf(surf_gy, ly, surf_gz * lz));
+        lambda -= (F - 1.f) / (df + 1e-8f);
+    }
+
+    /* One extra forward pass at the final λ for an accurate surface gradient. */
+    {
+        const float qx = lambda * lx;
+        const float qy = lambda * ly;
+        const float qz = lambda * lz;
+
+        const float ax = fmaxf(fabsf(qx) * __frcp_rn(sq.sx), 1e-9f);
+        const float ay = fmaxf(fabsf(qy) * __frcp_rn(sq.sy), 1e-9f);
+        const float az = fmaxf(fabsf(qz) * __frcp_rn(sq.sz), 1e-9f);
+
+        const float lax  = flog_safe(ax);
+        const float lay  = flog_safe(ay);
+        const float laz  = flog_safe(az);
+        const float sum  = __expf(p2 * lax) + __expf(p2 * lay);
+        const float lsum = flog_safe(sum);
+        const float ps   = __expf((e_ratio - 1.f) * lsum);
+        const float c    = 2.f * inv_e1;
+
+        surf_gx = c * __frcp_rn(sq.sx) * copysignf(1.f, qx) * ps * __expf((p2 - 1.f) * lax);
+        surf_gy = c * __frcp_rn(sq.sy) * copysignf(1.f, qy) * ps * __expf((p2 - 1.f) * lay);
+        surf_gz = c * __frcp_rn(sq.sz) * copysignf(1.f, qz)       * __expf((p1 - 1.f) * laz);
+    }
+
+    return lambda;
+}
+
+
 /* ═══════════════════════════ Core SDF ══════════════════════════════════════
  *
- * Returns the first-order signed-distance approximation for a sphere against
- * a superquadric, clamped by the conservative geometric lower bound.
+ * Returns the signed-distance for a sphere against a superquadric.
  *
  * Kernel sign convention (POSITIVE = outside / no collision):
  *   > 0  →  sphere outside SQ        (clearance ≈ value)
@@ -88,7 +227,9 @@ void rotate_by_quat_fwd(
  * Mathematics:
  *   F(p) = ((|x/sx|^{2/ε₂} + |y/sy|^{2/ε₂})^{ε₂/ε₁} + |z/sz|^{2/ε₁})
  *   F = 1 on the surface, > 1 outside, < 1 inside.
- *   SDF ≈ (F − 1) / ‖∇F‖  − r_sphere
+ *
+ *   Outside (F ≥ 1): SDF ≈ (F − 1) / ‖∇F‖ − r_sphere   (Taubin approx.)
+ *   Inside  (F < 1): SDF  = (1 − λ)·|p_local| − r_sphere  (Newton exact)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 __device__ __forceinline__
@@ -124,6 +265,16 @@ float sq_sdf(
     const float lsum = flog_safe(sum);
     const float F    = __expf(e_ratio * lsum) + zt;
 
+    // ── Inside: Newton radial projection → exact signed distance ─────────
+    if (F < 1.f) {
+        const float p_len = sqrtf(fmaf(lx, lx, fmaf(ly, ly, lz * lz)));
+        if (p_len < 1e-6f)
+            return -fminf(sq.sx, fminf(sq.sy, sq.sz)) - pr;
+        const float lambda = sq_newton_lambda(lx, ly, lz, sq);
+        return fmaf(1.f - lambda, p_len, -pr);
+    }
+
+    // ── Outside: Taubin approximation + conservative lower bounds ─────────
     const float sx_sign = copysignf(1.f, lx);
     const float sy_sign = copysignf(1.f, ly);
     const float sz_sign = copysignf(1.f, lz);
@@ -142,8 +293,6 @@ float sq_sdf(
     const float lb = sqrtf(fmaf(dx, dx, fmaf(dy, dy, dz * dz))) - r_outer - pr;
 
     // Tight lower bound: L2 distance to AABB in local SQ frame.
-    // For eps ≤ 2 the SQ surface is always inside its axis-aligned bounding box,
-    // so d_AABB(p) ≤ d_SQ(p) — a valid conservative lower bound.
     const float dx_box = fmaxf(fabsf(lx) - sq.sx, 0.f);
     const float dy_box = fmaxf(fabsf(ly) - sq.sy, 0.f);
     const float dz_box = fmaxf(fabsf(lz) - sq.sz, 0.f);
@@ -192,6 +341,27 @@ float sq_sdf_and_normal(
     const float lsum = flog_safe(sum);
     const float F    = __expf(e_ratio * lsum) + zt;
 
+    // ── Inside: Newton gives exact SDF and surface-point outward normal ───
+    if (F < 1.f) {
+        const float p_len = sqrtf(fmaf(lx, lx, fmaf(ly, ly, lz * lz)));
+        if (p_len < 1e-6f) {
+            // Near-origin fallback: point outward along local Z
+            rotate_by_quat_fwd(0.f, 0.f, 1.f,
+                               sq.qw, sq.qx, sq.qy, sq.qz,
+                               nx_world, ny_world, nz_world);
+            return -fminf(sq.sx, fminf(sq.sy, sq.sz)) - pr;
+        }
+        float sgx, sgy, sgz;
+        const float lambda = sq_newton_lambda_and_surf_grad(lx, ly, lz, sq,
+                                                             sgx, sgy, sgz);
+        const float inv_sg = rsqrtf(fmaf(sgx, sgx, fmaf(sgy, sgy, sgz * sgz)) + 1e-8f);
+        rotate_by_quat_fwd(sgx * inv_sg, sgy * inv_sg, sgz * inv_sg,
+                           sq.qw, sq.qx, sq.qy, sq.qz,
+                           nx_world, ny_world, nz_world);
+        return fmaf(1.f - lambda, p_len, -pr);
+    }
+
+    // ── Outside: Taubin approximation + normal at query point ─────────────
     const float sx_sign = copysignf(1.f, lx);
     const float sy_sign = copysignf(1.f, ly);
     const float sz_sign = copysignf(1.f, lz);
@@ -203,10 +373,10 @@ float sq_sdf_and_normal(
     const float gz = c * __frcp_rn(sq.sz) * sz_sign       * __expf((p1 - 1.f) * laz);
     const float g2 = fmaf(gx, gx, fmaf(gy, gy, gz * gz));
 
-    const float inv_g   = rsqrtf(g2 + 1e-8f);
+    const float inv_g      = rsqrtf(g2 + 1e-8f);
     const float sdf_approx = fmaf(F - 1.f, inv_g, -pr);
 
-    // Lower bounds (identical to sq_sdf)
+    // Lower bounds (identical to sq_sdf outside path)
     const float r_outer = fmaxf(sq.sx, fmaxf(sq.sy, sq.sz));
     const float lb      = sqrtf(fmaf(dx, dx, fmaf(dy, dy, dz * dz))) - r_outer - pr;
     const float dx_box  = fmaxf(fabsf(lx) - sq.sx, 0.f);
@@ -214,9 +384,6 @@ float sq_sdf_and_normal(
     const float dz_box  = fmaxf(fabsf(lz) - sq.sz, 0.f);
     const float lb_box  = sqrtf(fmaf(dx_box, dx_box, fmaf(dy_box, dy_box, dz_box * dz_box))) - pr;
 
-    // World-frame unit outward normal: rotate local ∇F/‖∇F‖ to world frame.
-    // We always use the SQ normal even when the lower-bound clamp is active;
-    // it remains a good direction for the optimizer.
     const float lnx = gx * inv_g;
     const float lny = gy * inv_g;
     const float lnz = gz * inv_g;
