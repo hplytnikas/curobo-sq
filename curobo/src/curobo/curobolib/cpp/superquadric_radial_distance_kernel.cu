@@ -87,18 +87,29 @@ void rotate_by_quat_fwd(
  * Iteration: λ ← λ − (F(λp) − 1) / (∇F(λp) · p),  starting from λ = 1.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/* sq_newton_lambda: returns λ for the radial distance (no gradient output). */
+/* sq_newton_lambda: returns λ for the radial distance (no gradient output).
+ *
+ * F_init: F evaluated at the original query point (passed from sq_sdf to
+ * avoid recomputation).  Used to set a near-optimal starting λ via the
+ * scaling identity F(λ·p) ≈ λ^(2/ε₁)·F(p), giving λ_init = F^(−ε₁/2).
+ * This prevents the catastrophic first-step overshoot that occurs for boxy
+ * shapes (small ε) when starting from λ=1, where F is nearly zero and
+ * ∇F·p is exponentially small, causing the Newton step to diverge to ~10⁴
+ * and triggering float32 exp() overflow → NaN → false "no-collision". */
 __device__ __forceinline__
 float sq_newton_lambda(
     const float lx, const float ly, const float lz,
-    const SQData& sq)
+    const SQData& sq,
+    const float F_init)
 {
     const float inv_e1  = __frcp_rn(sq.eps1);
     const float p1      = 2.f * inv_e1;
     const float p2      = 2.f * __frcp_rn(sq.eps2);
     const float e_ratio = sq.eps2 * inv_e1;
 
-    float lambda = 1.f;
+    // Better initial λ: F(λp) ≈ λ^(2/ε₁)·F(p)  →  λ_star ≈ F^(-ε₁/2)
+    // For λ inside (F < 1) this gives λ > 1, landing near the surface.
+    float lambda = fmaxf(1.f, __powf(fmaxf(F_init, 1e-30f), -0.5f * sq.eps1));
 
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -138,19 +149,21 @@ float sq_newton_lambda(
 }
 
 /* sq_newton_lambda_and_surf_grad: returns λ AND ∇F at the final surface point.
- * Used by sq_sdf_and_normal so the gradient path also gets a correct normal. */
+ * Used by sq_sdf_and_normal so the gradient path also gets a correct normal.
+ * F_init: same role as in sq_newton_lambda — seeds a better starting λ. */
 __device__ __forceinline__
 float sq_newton_lambda_and_surf_grad(
     const float lx, const float ly, const float lz,
     const SQData& sq,
-    float& surf_gx, float& surf_gy, float& surf_gz)
+    float& surf_gx, float& surf_gy, float& surf_gz,
+    const float F_init)
 {
     const float inv_e1  = __frcp_rn(sq.eps1);
     const float p1      = 2.f * inv_e1;
     const float p2      = 2.f * __frcp_rn(sq.eps2);
     const float e_ratio = sq.eps2 * inv_e1;
 
-    float lambda = 1.f;
+    float lambda = fmaxf(1.f, __powf(fmaxf(F_init, 1e-30f), -0.5f * sq.eps1));
 
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -270,7 +283,7 @@ float sq_sdf(
         const float p_len = sqrtf(fmaf(lx, lx, fmaf(ly, ly, lz * lz)));
         if (p_len < 1e-6f)
             return -fminf(sq.sx, fminf(sq.sy, sq.sz)) - pr;
-        const float lambda = sq_newton_lambda(lx, ly, lz, sq);
+        const float lambda = sq_newton_lambda(lx, ly, lz, sq, F);
         return fmaf(1.f - lambda, p_len, -pr);
     }
 
@@ -353,7 +366,7 @@ float sq_sdf_and_normal(
         }
         float sgx, sgy, sgz;
         const float lambda = sq_newton_lambda_and_surf_grad(lx, ly, lz, sq,
-                                                             sgx, sgy, sgz);
+                                                             sgx, sgy, sgz, F);
         const float inv_sg = rsqrtf(fmaf(sgx, sgx, fmaf(sgy, sgy, sgz * sgz)) + 1e-8f);
         rotate_by_quat_fwd(sgx * inv_sg, sgy * inv_sg, sgz * inv_sg,
                            sq.qw, sq.qx, sq.qy, sq.qz,

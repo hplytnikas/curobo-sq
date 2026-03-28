@@ -8,7 +8,7 @@ This project integrates **superquadric obstacle representations** into [CuRobo](
 
 1. **SuperDec** (`superdec/`): Neural network (transformer encoder-decoder) that decomposes 3D point clouds into superquadric primitives
 2. **CuRobo** (`curobo/`): Fork with native superquadric SDF/collision kernels added
-3. **OpenGJK** (`openGJK/`): GJK collision detection with GPU support, used for validation
+3. **OpenGJK** (`openGJK/`): Standalone GJK collision library — **not used in the planning pipeline**; kept for independent geometry validation only
 
 ## Python Environment
 
@@ -45,14 +45,14 @@ PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH ~/isaacsim/python.sh \
 ### Data flow
 1. `Superquadric` geometry type is defined in `curobo/src/curobo/geom/types.py`
 2. `pack_env_sq()` in `curobo/src/curobolib/cpp/superquadric_radial_distance_kernel.cu` packs SQ parameters (radii a/b/c, shape eps1/eps2, pose) into a flat GPU buffer — **quaternion order is `[qw, qx, qy, qz]`** (was a bug when it was `[qx,qy,qz,qw]`)
-3. `superquadric_distance_kernel.cu` calls the radial distance kernel for batched sphere-vs-SQ queries
+3. `superquadric_radial_distance_kernel.cu` implements batched sphere-vs-SQ queries using an analytical Newton radial projection (no external library required)
 4. `geom_cuda.cpp` exposes the CUDA functions via pybind11 as the `geom` extension module
 
 ### Key files for SQ collision
 | File | Role |
 |------|------|
-| `curobo/src/curobolib/cpp/superquadric_radial_distance_kernel.cu` | Core SDF math, `pack_env_sq` |
-| `curobo/src/curobolib/cpp/superquadric_distance_kernel.cu` | Batched wrapper, swept sphere |
+| `curobo/src/curobolib/cpp/superquadric_radial_distance_kernel.cu` | **Active kernel**: analytical SDF, gradient, `pack_env_sq`, swept sphere |
+| `curobo/src/curobolib/cpp/superquadric_distance_kernel.cu` | Legacy file — **not compiled**, kept for reference only |
 | `curobo/src/curobolib/cpp/geom_cuda.cpp` | pybind11 C++ wrapper |
 | `curobo/src/curobo/geom/types.py` | `Superquadric` class definition |
 | `tests/test_sq_rotation.py` | Regression tests (5 scenarios) |
@@ -63,7 +63,10 @@ PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH ~/isaacsim/python.sh \
 - **Head**: outputs per-SQ: radii (a,b,c), shape (eps1,eps2), position (x,y,z), quaternion
 - Training uses Hydra config at `superdec/configs/train.yaml`
 
-## Building OpenGJK (for validation/standalone use)
+## Building OpenGJK (standalone geometry validation only)
+
+OpenGJK is **not part of the planning pipeline**. Build it only if you need to
+cross-validate SQ geometry against an independent collision library.
 ```bash
 cmake -B openGJK/build -DCMAKE_BUILD_TYPE=Release -DBUILD_GPU=ON \
   -S openGJK -DCMAKE_CUDA_ARCHITECTURES=89

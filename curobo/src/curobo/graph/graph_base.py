@@ -311,7 +311,10 @@ class GraphPlanBase(GraphConfig):
                 x_samples.unsqueeze(1), use_batch_env=False
             )
             d.append(metrics.feasible)
-        mask = torch.cat(d).squeeze()
+        # .clone() is critical: metrics.feasible may be a view into a pre-allocated
+        # CuRobo rollout buffer. Without it, the next rollout_constraint call overwrites
+        # the same buffer, corrupting any previously returned mask that still aliases it.
+        mask = torch.cat(d).squeeze().clone()
         return mask
 
     def _cuda_graph_rollout_constraint(self, x_samples, use_batch_env=False):

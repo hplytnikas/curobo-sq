@@ -9,6 +9,16 @@
  * its affiliates is strictly prohibited.
  */
 
+/*
+ * NOTE: This file is NOT compiled and is kept for historical reference only.
+ *
+ * The active superquadric collision implementation is in:
+ *   superquadric_radial_distance_kernel.cu
+ *
+ * That file implements analytical SDF + gradient using Newton radial projection
+ * and does not depend on any external library.
+ */
+
 #include <cuda_runtime.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>

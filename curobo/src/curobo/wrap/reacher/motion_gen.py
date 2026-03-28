@@ -3414,10 +3414,11 @@ class MotionGen(MotionGenConfig):
                 result.success[:] = False
                 result.status = MotionGenStatus.GRAPH_FAIL
                 if not graph_result.valid_query:
-                    result.valid_query = False
+                    # Graph planner uses a conservative binary feasibility check that
+                    # can produce false positives (e.g. with over-approximated SQ
+                    # obstacles). Do not abort here — let trajopt attempt a solution.
                     if self.store_debug_in_result:
                         result.debug_info["graph_debug"] = graph_result.debug_info
-                    return result
                 if plan_config.need_graph_success:
                     return result
 
@@ -3694,10 +3695,9 @@ class MotionGen(MotionGenConfig):
                 result.success = torch.as_tensor([False], device=self.tensor_args.device)
                 result.status = MotionGenStatus.GRAPH_FAIL
                 if not graph_result.valid_query:
-                    result.valid_query = False
+                    # Conservative SQ feasibility check — do not abort; let trajopt try.
                     if self.store_debug_in_result:
                         result.debug_info["graph_debug"] = graph_result.debug_info
-                    return result
                 if plan_config.need_graph_success:
                     return result
 
@@ -3992,10 +3992,9 @@ class MotionGen(MotionGenConfig):
                 result.success = result.success[:, 0]
                 result.status = MotionGenStatus.GRAPH_FAIL
                 if not graph_result.valid_query:
-                    result.valid_query = False
+                    # Conservative SQ feasibility check — do not abort; let trajopt try.
                     if self.store_debug_in_result:
                         result.debug_info = {"graph_debug": graph_result.debug_info}
-                    return result
 
         if plan_config.enable_opt:
             # get goal configs based on ik success:

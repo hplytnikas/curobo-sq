@@ -1,10 +1,11 @@
-"""Test GJK path (sphere_superquadric_clpt) with actual retract spheres and scene SQs.
+"""Test radial-distance kernel (sphere_superquadric_clpt) with actual retract spheres and scene SQs.
 
-Checks whether the local-AABB lower bound fix in superquadric_distance_kernel.cu
-correctly prevents false-positive collisions for spheres far from the SQ surface.
+Checks whether the analytical SDF kernel in superquadric_radial_distance_kernel.cu
+correctly reports collision for spheres penetrating SQ obstacles and reports clear
+for spheres far from the SQ surface.
 
 Run with:
-  PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH ~/isaacsim/python.sh tests/test_gjk_retract.py
+  PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH ~/isaacsim/python.sh tests/test_sq_clpt.py
 """
 
 import sys
@@ -96,7 +97,7 @@ RETRACT_SPHERES = [
     (0.0544,  0.0424,  0.5272, 0.0150),
 ]
 
-print("=== GJK path (WorldPrimitiveCollision) test ===\n")
+print("=== Radial-distance kernel (WorldPrimitiveCollision) test ===\n")
 print("Building world with all 8 SQs...", flush=True)
 
 # Build SQ objects with CuRobo pose convention [cx,cy,cz, qw,qx,qy,qz]
@@ -144,8 +145,9 @@ if q.superquadric_collision_buffer is not None:
         print(f"  sphere[{i:2d}] ({x:7.4f},{y:7.4f},{z:7.4f}) r={r:.3f}  sdf={v:+.4f}{flag}")
         if v > 0:
             n_collide += 1
-    print(f"\n  {n_collide}/{len(RETRACT_SPHERES)} spheres report collision via GJK path")
+    print(f"\n  {n_collide}/{len(RETRACT_SPHERES)} spheres report collision via radial-distance kernel")
 else:
-    print("  No superquadric collision buffer found (GJK path not available or no SQs loaded)")
+    print("  No superquadric collision buffer found (kernel not available or no SQs loaded)")
 
 print("\nDone.")
+timeout

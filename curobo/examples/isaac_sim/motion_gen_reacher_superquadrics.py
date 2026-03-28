@@ -220,7 +220,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--superquadric_min_eps",
         type=float,
-        default=0.05,
+        default=0.1,
         help=(
             "Lower clamp for SuperDec exponents before collision world creation. "
             "Increase to reduce very boxy primitives that can destabilize distance queries."
@@ -279,7 +279,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--plan_timeout",
         type=float,
-        default=4.0,
+        default=0.5,
         help="Per-plan timeout in seconds. Reduce to keep Isaac Sim responsive.",
     )
     parser.add_argument(
@@ -363,7 +363,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--disable_swept_collision",
         action="store_true",
-        default=False,
+        default=True,
         help=(
             "Disable swept collision kernels during trajopt/finetune and fall back to "
             "discrete per-timestep collision checks."
@@ -792,6 +792,7 @@ def update_sdf_gradient_prim(
 
     # Fallback path: autograd from ESDF scalar field.
     if grad_vec is None:
+        print("Using autograd fallback")
         grad = torch.autograd.grad(
             outputs=dist.sum(),
             inputs=query,
@@ -1265,8 +1266,9 @@ def maybe_limit_superquadrics(superquadrics: List[Superquadric]) -> List[Superqu
 def ensure_superquadric_support() -> None:
     if not hasattr(geom_cu, "closest_point_superquadric"):
         raise RuntimeError(
-            "CuRobo was built without native superquadric support. Rebuild with OpenGJK "
-            "available at openGJK/gpu, or run this example with --world_representation mesh."
+            "CuRobo was built without native superquadric support. Rebuild the package "
+            "(superquadric_radial_distance_kernel.cu must be compiled in), or run this "
+            "example with --world_representation mesh."
         )
 
 
@@ -1630,9 +1632,10 @@ def build_motion_gen(robot_cfg, collision_world: WorldConfig, tensor_args: Tenso
         trim_steps = [1, None]
         interpolation_dt = trajopt_dt
 
-    # The OpenGJK superquadric kernel does not support CUDA stream capture.
-    # We still allow graph planning in native SQ mode by disabling CUDA graph
-    # capture globally for IK/trajopt/graph rollouts (use_cuda_graph=False).
+    # The superquadric radial-distance kernel uses mask.nonzero() which produces
+    # dynamic-shaped tensors incompatible with CUDA graph stream capture.
+    # Disable CUDA graph capture globally for IK/trajopt/graph rollouts when
+    # superquadrics are in use (use_cuda_graph=False).
     has_superquadrics = bool(collision_world.superquadric)
     superquadric_count = len(collision_world.superquadric) if has_superquadrics else 0
     interactive_mode = args.headless_mode is None
@@ -1676,7 +1679,7 @@ def build_motion_gen(robot_cfg, collision_world: WorldConfig, tensor_args: Tenso
         num_batch_ik_seeds = min(num_batch_ik_seeds, 4)
         num_trajopt_seeds = min(num_trajopt_seeds, 2)
         trajopt_tsteps = min(trajopt_tsteps, 24)
-        interpolation_steps = min(interpolation_steps, 1200)
+        interpolation_steps = min(interpolation_steps, 1500)
     elif memory_profile == "low":
         num_ik_seeds = min(num_ik_seeds, 2)
         num_batch_ik_seeds = min(num_batch_ik_seeds, 2)
@@ -1738,7 +1741,8 @@ def build_motion_gen(robot_cfg, collision_world: WorldConfig, tensor_args: Tenso
         args.trajopt_only,
     )
 
-    # The OpenGJK superquadric kernel does not support CUDA stream capture.
+    # The superquadric radial-distance kernel uses mask.nonzero() which produces
+    # dynamic-shaped tensors incompatible with CUDA graph stream capture.
     # CUDA graphs are used not only by the graph planner but also internally by
     # the IK and trajopt particle optimisers (particle_opt_base._initialize_cuda_graph).
     # Setting use_cuda_graph=False disables graph capture across all solvers so

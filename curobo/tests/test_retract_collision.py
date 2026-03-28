@@ -25,7 +25,7 @@ tensor_args = TensorDeviceType(device=torch.device("cuda:0"), dtype=torch.float3
 # ── SQ parameters from headless diagnostic (raw Python tensor layout):
 # [sx, sy, sz, eps1, eps2, cx, cy, cz, qx, qy, qz, qw]
 # These are the scene SQs AFTER scene transform and tolerance=0.01m shrink.
-# Note: OpenGJK and CuRobo's Python storage both use [qx,qy,qz,qw] (scalar last).
+# Note: CuRobo's Python storage uses [qx,qy,qz,qw] (scalar last).
 SCENE_SQS = [
     # name      sx      sy      sz     eps1    eps2     cx       cy       cz     qx      qy      qz      qw
     ("sq_0",  0.0885, 0.3706, 0.3536, 0.2486, 0.3636, -0.2314, -0.6889,  0.0274, -0.5060, -0.4957, -0.4999,  0.4983),
@@ -151,7 +151,7 @@ for row in SCENE_SQS:
 
 print("\n=== Summary ===")
 if not colliding_pairs:
-    print("  No genuine collisions found with ESDF kernel. The issue is in the GJK path.")
+    print("  No genuine collisions found with ESDF kernel.")
 else:
     print(f"  {len(colliding_pairs)} genuine collision(s):")
     for name, d, sph_idx, (x, y, z, r) in colliding_pairs:
