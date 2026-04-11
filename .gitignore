@@ -1,6 +1,5 @@
 .vscode*
 *.hdf5
-*data/
 *.bat
 *.p
 *.mlx
@@ -16,7 +15,7 @@ __pycache__/
 
 # C extensions
 *.so
-requirements.txt
+
 # Distribution / packaging
 .Python
 build/
@@ -455,7 +454,6 @@ superdec/fast_sampler/_sampler.cpp
 render*
 *.mp4
 build*
-data*
 tmp*
 *.pt
 checkpoints*
