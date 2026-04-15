@@ -18,12 +18,14 @@ import torch
 _cuda_warmup = torch.zeros(4, device="cuda:0")
 
 import argparse
+import csv
 import copy
 import queue
 import threading
 import sys
 import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import List
 import numpy as np
@@ -397,6 +399,15 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--sdf_trace_log_interval",
+        type=int,
+        default=1,
+        help=(
+            "Simulation steps between SDF/gradient trace log samples. "
+            "Lower values provide denser logs."
+        ),
+    )
+    parser.add_argument(
         "--debug_ik_fail_details",
         action="store_true",
         default=False,
@@ -524,7 +535,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--auto_target_interval",
         type=int,
-        default=120,
+        default=400,
         help="Simulation steps between automatic cube target changes (used with --auto_cube_targets).",
     )
     parser.add_argument(
@@ -958,6 +969,347 @@ def _safe_float(value, default: float = float("nan")) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def create_plan_time_log_file() -> Path:
+    """Create a new per-session CSV file for planner timing metrics."""
+    workspace_root = Path(__file__).resolve().parents[3]
+    logs_dir = workspace_root / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = logs_dir / f"motion_gen_superquadrics_timings_{session_stamp}.csv"
+
+    with log_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(
+            [
+                "session_timestamp",
+                "event_timestamp",
+                "plan_id",
+                "step_index",
+                "status",
+                "success",
+                "plan_status",
+                "attempts",
+                "wall_time_s",
+                "total_time_s",
+                "ik_time_s",
+                "graph_time_s",
+                "trajopt_time_s",
+                "used_graph",
+                "escape_retract",
+                "world_representation",
+                "target_position",
+                "target_x",
+                "target_y",
+                "target_z",
+                "error",
+            ]
+        )
+
+    return log_path
+
+
+def create_sdf_trace_log_file() -> Path:
+    """Create a new per-session CSV file for SDF and gradient traces."""
+    workspace_root = Path(__file__).resolve().parents[3]
+    logs_dir = workspace_root / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = logs_dir / f"motion_gen_superquadrics_sdf_trace_{session_stamp}.csv"
+
+    with log_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(
+            [
+                "session_timestamp",
+                "event_timestamp",
+                "step_index",
+                "phase",
+                "plan_id",
+                "target_id",
+                "target_position",
+                "world_representation",
+                "sphere_index",
+                "sphere_x",
+                "sphere_y",
+                "sphere_z",
+                "sphere_radius",
+                "sdf",
+                "grad_x",
+                "grad_y",
+                "grad_z",
+                "grad_mag",
+                "gradient_source",
+                "error",
+            ]
+        )
+
+    return log_path
+
+
+def _extract_robot_spheres_array(motion_gen: "MotionGen", cu_js: "JointState") -> np.ndarray:
+    """Return robot spheres as an (N,4) numpy array of [x,y,z,r]."""
+    spheres = motion_gen.kinematics.get_robot_as_spheres(cu_js.position)
+    if spheres is None:
+        return np.empty((0, 4), dtype=np.float32)
+
+    if hasattr(spheres, "detach"):
+        sph_np = spheres.detach().cpu().numpy()
+        if sph_np.size == 0:
+            return np.empty((0, 4), dtype=np.float32)
+        return sph_np.reshape(-1, 4).astype(np.float32)
+
+    if isinstance(spheres, (list, tuple)):
+        rows = []
+        for batch_item in spheres:
+            if isinstance(batch_item, (list, tuple)):
+                for s in batch_item:
+                    if hasattr(s, "position") and hasattr(s, "radius"):
+                        rows.append(
+                            [
+                                float(s.position[0]),
+                                float(s.position[1]),
+                                float(s.position[2]),
+                                float(s.radius),
+                            ]
+                        )
+            elif hasattr(batch_item, "position") and hasattr(batch_item, "radius"):
+                rows.append(
+                    [
+                        float(batch_item.position[0]),
+                        float(batch_item.position[1]),
+                        float(batch_item.position[2]),
+                        float(batch_item.radius),
+                    ]
+                )
+        if len(rows) == 0:
+            return np.empty((0, 4), dtype=np.float32)
+        return np.asarray(rows, dtype=np.float32)
+
+    sph_np = np.asarray(spheres, dtype=np.float32)
+    if sph_np.size == 0:
+        return np.empty((0, 4), dtype=np.float32)
+    return sph_np.reshape(-1, 4)
+
+
+def append_sdf_trace_log(
+    log_path: Path,
+    session_stamp: str,
+    step_index: int,
+    phase: str,
+    plan_id: int,
+    target_id: str,
+    target_position,
+    world_representation: str,
+    motion_gen: "MotionGen",
+    cu_js: "JointState",
+) -> None:
+    """Append per-sphere SDF and gradient values for the current robot state."""
+    target_x = float("nan")
+    target_y = float("nan")
+    target_z = float("nan")
+    if target_position is not None:
+        target_x = _safe_float(target_position[0])
+        target_y = _safe_float(target_position[1])
+        target_z = _safe_float(target_position[2])
+    target_position_str = (
+        f"[{target_x:.6f},{target_y:.6f},{target_z:.6f}]"
+        if np.isfinite(target_x) and np.isfinite(target_y) and np.isfinite(target_z)
+        else ""
+    )
+
+    rows = []
+    try:
+        spheres_np = _extract_robot_spheres_array(motion_gen, cu_js)
+        if spheres_np.shape[0] == 0:
+            return
+
+        active_mask = np.isfinite(spheres_np).all(axis=1) & (spheres_np[:, 3] > 0.0)
+        if not np.any(active_mask):
+            return
+        spheres_np = spheres_np[active_mask]
+
+        device = motion_gen.tensor_args.device
+        query = torch.zeros((spheres_np.shape[0], 1, 1, 4), dtype=torch.float32, device=device)
+        query[:, 0, 0, :] = torch.from_numpy(spheres_np).to(device=device, dtype=torch.float32)
+        query.requires_grad_(True)
+
+        coll_buffer = CollisionQueryBuffer()
+        coll_buffer.update_buffer_shape(
+            query.shape,
+            motion_gen.world_coll_checker.tensor_args,
+            motion_gen.world_coll_checker.collision_types,
+        )
+        weight = motion_gen.world_coll_checker.tensor_args.to_device([1.0])
+        dist = motion_gen.world_coll_checker.get_sphere_distance(
+            query,
+            coll_buffer,
+            weight,
+            motion_gen.world_coll_checker.max_distance,
+            sum_collisions=False,
+            compute_esdf=True,
+        )
+        dist_flat = dist.detach().reshape(-1)
+
+        grad_vec = None
+        gradient_source = "none"
+        try:
+            grad_buffer = coll_buffer.get_gradient_buffer()
+            if grad_buffer is not None:
+                candidate = grad_buffer[:, 0, 0, :3]
+                if torch.count_nonzero(torch.isfinite(candidate)).item() > 0:
+                    grad_vec = candidate.detach()
+                    gradient_source = "buffer"
+        except Exception:
+            grad_vec = None
+
+        if grad_vec is None:
+            grad = torch.autograd.grad(
+                outputs=dist.sum(),
+                inputs=query,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )[0]
+            if grad is not None:
+                grad_vec = grad[:, 0, 0, :3].detach()
+                gradient_source = "autograd"
+
+        if grad_vec is None:
+            grad_np = np.full((spheres_np.shape[0], 3), np.nan, dtype=np.float32)
+        else:
+            grad_np = grad_vec.detach().cpu().numpy().astype(np.float32)
+
+        dist_np = dist_flat.detach().cpu().numpy().astype(np.float32)
+        event_ts = datetime.now().isoformat(timespec="milliseconds")
+        for i in range(spheres_np.shape[0]):
+            gx = _safe_float(grad_np[i, 0])
+            gy = _safe_float(grad_np[i, 1])
+            gz = _safe_float(grad_np[i, 2])
+            gmag = float(np.sqrt(gx * gx + gy * gy + gz * gz)) if np.isfinite([gx, gy, gz]).all() else float("nan")
+            rows.append(
+                [
+                    session_stamp,
+                    event_ts,
+                    int(step_index),
+                    phase,
+                    int(plan_id),
+                    target_id,
+                    target_position_str,
+                    world_representation,
+                    int(i),
+                    _safe_float(spheres_np[i, 0]),
+                    _safe_float(spheres_np[i, 1]),
+                    _safe_float(spheres_np[i, 2]),
+                    _safe_float(spheres_np[i, 3]),
+                    _safe_float(dist_np[i]),
+                    gx,
+                    gy,
+                    gz,
+                    gmag,
+                    gradient_source,
+                    "",
+                ]
+            )
+    except Exception as exc:
+        rows.append(
+            [
+                session_stamp,
+                datetime.now().isoformat(timespec="milliseconds"),
+                int(step_index),
+                phase,
+                int(plan_id),
+                target_id,
+                target_position_str,
+                world_representation,
+                -1,
+                float("nan"),
+                float("nan"),
+                float("nan"),
+                float("nan"),
+                float("nan"),
+                float("nan"),
+                float("nan"),
+                float("nan"),
+                float("nan"),
+                "none",
+                str(exc),
+            ]
+        )
+
+    if not rows:
+        return
+    with log_path.open("a", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerows(rows)
+
+
+def append_plan_time_log(
+    log_path: Path,
+    session_stamp: str,
+    plan_id: int,
+    step_index: int,
+    status: str,
+    success: bool | None,
+    plan_status: str,
+    attempts: float,
+    wall_time_s: float,
+    total_time_s: float,
+    ik_time_s: float,
+    graph_time_s: float,
+    trajopt_time_s: float,
+    used_graph: bool,
+    escape_retract: bool,
+    world_representation: str,
+    target_position,
+    error: str,
+) -> None:
+    """Append one planning timing row to the session CSV file."""
+    target_x = float("nan")
+    target_y = float("nan")
+    target_z = float("nan")
+    if target_position is not None:
+        try:
+            target_x = _safe_float(target_position[0])
+            target_y = _safe_float(target_position[1])
+            target_z = _safe_float(target_position[2])
+        except Exception:
+            pass
+
+    with log_path.open("a", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(
+            [
+                session_stamp,
+                datetime.now().isoformat(timespec="milliseconds"),
+                int(plan_id),
+                int(step_index),
+                status,
+                "" if success is None else bool(success),
+                plan_status,
+                attempts,
+                wall_time_s,
+                total_time_s,
+                ik_time_s,
+                graph_time_s,
+                trajopt_time_s,
+                bool(used_graph),
+                bool(escape_retract),
+                world_representation,
+                (
+                    f"[{target_x:.6f},{target_y:.6f},{target_z:.6f}]"
+                    if np.isfinite(target_x) and np.isfinite(target_y) and np.isfinite(target_z)
+                    else ""
+                ),
+                target_x,
+                target_y,
+                target_z,
+                error,
+            ]
+        )
 
 
 def _format_grad_tensor_stats(name: str, tensor: torch.Tensor) -> str:
@@ -1819,8 +2171,47 @@ def _plan_worker(
         # Wait for any ops on the default stream (e.g. cu_js.clone()) to finish
         # before we start issuing work on this stream.
         planning_stream.wait_stream(default_stream)
+
+        def _is_graph_shape_exception(exc: Exception, tb_text: str) -> bool:
+            msg = str(exc)
+            return (
+                "invalid for input of size 3" in msg
+                and "compute_kinematics" in tb_text
+                and "graph_base.py" in tb_text
+            )
+
+        def _plan_single_with_graph_guard(
+            cfg: MotionGenPlanConfig,
+            context: str,
+            allow_graph_guard: bool = True,
+        ):
+            try:
+                return motion_gen.plan_single(cu_js.unsqueeze(0), ik_goal, cfg)
+            except RuntimeError as exc:
+                tb_text = traceback.format_exc()
+                if (not allow_graph_guard) or (not _is_graph_shape_exception(exc, tb_text)):
+                    raise
+
+                fallback_cfg = copy.deepcopy(cfg)
+                fallback_cfg.enable_graph = False
+                fallback_cfg.enable_graph_attempt = 0
+                fallback_cfg.need_graph_success = False
+                fallback_cfg.enable_opt = True
+                fallback_cfg.enable_finetune_trajopt = bool(
+                    getattr(cfg, "enable_finetune_trajopt", True)
+                )
+                fallback_cfg.parallel_finetune = False
+                if getattr(fallback_cfg, "check_start_validity", None) is not None and has_superquadrics:
+                    fallback_cfg.check_start_validity = False
+
+                carb.log_warn(
+                    "Graph-search shape exception detected during "
+                    f"{context}; retrying the same request with graph disabled."
+                )
+                return motion_gen.plan_single(cu_js.unsqueeze(0), ik_goal, fallback_cfg)
+
         try:
-            result = motion_gen.plan_single(cu_js.unsqueeze(0), ik_goal, plan_config)
+            result = _plan_single_with_graph_guard(plan_config, context="initial solve")
             if (
                 has_superquadrics
                 and result.status == MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION
@@ -1831,7 +2222,10 @@ def _plan_worker(
                 )
                 retry_config = copy.deepcopy(plan_config)
                 retry_config.check_start_validity = False
-                result = motion_gen.plan_single(cu_js.unsqueeze(0), ik_goal, retry_config)
+                result = _plan_single_with_graph_guard(
+                    retry_config,
+                    context="start-validity retry",
+                )
             if (
                 has_superquadrics
                 and (not args.disable_superquadric_ik_retry)
@@ -1857,7 +2251,10 @@ def _plan_worker(
                     f"num_ik_seeds={retry_config.num_ik_seeds} "
                     f"max_attempts={retry_config.max_attempts} timeout={retry_config.timeout}."
                 )
-                retry_result = motion_gen.plan_single(cu_js.unsqueeze(0), ik_goal, retry_config)
+                retry_result = _plan_single_with_graph_guard(
+                    retry_config,
+                    context="ik retry",
+                )
                 if bool(retry_result.success.item()):
                     result = retry_result
             if (
@@ -1879,7 +2276,10 @@ def _plan_worker(
                     "Retrying superquadric plan after trajopt failure with "
                     f"max_attempts={retry_config.max_attempts} timeout={retry_config.timeout}."
                 )
-                retry_result = motion_gen.plan_single(cu_js.unsqueeze(0), ik_goal, retry_config)
+                retry_result = _plan_single_with_graph_guard(
+                    retry_config,
+                    context="trajopt retry",
+                )
                 if bool(retry_result.success.item()):
                     result = retry_result
             if (
@@ -1907,10 +2307,10 @@ def _plan_worker(
                     "Retrying superquadric plan with graph-only fallback "
                     f"(max_attempts={graph_only_config.max_attempts} timeout={graph_only_config.timeout})."
                 )
-                graph_only_result = motion_gen.plan_single(
-                    cu_js.unsqueeze(0),
-                    ik_goal,
+                graph_only_result = _plan_single_with_graph_guard(
                     graph_only_config,
+                    context="graph-only fallback",
+                    allow_graph_guard=True,
                 )
                 if bool(graph_only_result.success.item()):
                     carb.log_warn(
@@ -2020,6 +2420,11 @@ def main() -> None:
 
     collision_world, visual_world, superquadric_world = build_collision_and_visual_worlds()
     motion_gen = build_motion_gen(robot_cfg, collision_world, tensor_args)
+    timing_session_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timing_log_path = create_plan_time_log_file()
+    sdf_trace_log_path = create_sdf_trace_log_file()
+    print(f"Planner timing CSV log: {timing_log_path}")
+    print(f"SDF trace CSV log: {sdf_trace_log_path}")
     
     # ── Diagnostic: dump sq_params to verify radii reach the kernel ──────────
     try:
@@ -2445,6 +2850,7 @@ def main() -> None:
     sdf_gradient_tip_prim = None
     sdf_gradient_shaft_prim = None
     last_sdf_update_step = -10_000_000
+    last_sdf_trace_log_step = -10_000_000
 
     my_world.scene.add_default_ground_plane()
 
@@ -2462,8 +2868,9 @@ def main() -> None:
             "SDF gradient visualization enabled. Arrows are rendered as shaft points + green tips."
         )
 
-    # Parse automatic cube target positions (headless testing / debugging).
+    # Parse automatic cube target positions for both interactive and headless runs.
     auto_cube_positions = None
+
     if args.auto_cube_targets is not None:
         import json as _json
         try:
@@ -2473,7 +2880,7 @@ def main() -> None:
                   f"cycling every {args.auto_target_interval} steps.", flush=True)
         except Exception as _exc:
             print(f"[auto-targets] Failed to parse --auto_cube_targets: {_exc}", flush=True)
-    auto_target_idx = 0
+    auto_target_idx = -1
 
     # In headless mode the world is never played interactively — start it automatically.
     if not interactive_mode:
@@ -2489,6 +2896,7 @@ def main() -> None:
             continue
 
         step_index = my_world.current_time_step_index
+        
 
         # Auto-exit after --max_frames steps.
         if args.max_frames > 0 and step_index >= args.max_frames:
@@ -2508,7 +2916,7 @@ def main() -> None:
         if step_index < 20:
             continue
 
-        # Automatic cube target cycling (headless / debugging mode).
+        # Automatic cube target cycling (interactive and headless modes).
         if auto_cube_positions is not None and step_index > 20:
             interval = max(args.auto_target_interval, 1)
             new_auto_idx = (step_index // interval) % len(auto_cube_positions)
@@ -2638,6 +3046,36 @@ def main() -> None:
                 _result_status = _format_plan_status(
                     getattr(plan_result, "status", None), success=bool(success)
                 )
+                active_world_representation = (
+                    "superquadrics"
+                    if has_superquadrics and bool(collision_world.superquadric)
+                    else "mesh"
+                )
+                wall_time_s = (
+                    _safe_float(time.perf_counter() - active_plan_start_time)
+                    if active_plan_start_time > 0.0
+                    else float("nan")
+                )
+                append_plan_time_log(
+                    log_path=timing_log_path,
+                    session_stamp=timing_session_stamp,
+                    plan_id=active_plan_request_id,
+                    step_index=step_index,
+                    status="ok",
+                    success=bool(success),
+                    plan_status=_result_status,
+                    attempts=_safe_float(getattr(plan_result, "attempts", float("nan"))),
+                    wall_time_s=wall_time_s,
+                    total_time_s=_safe_float(getattr(plan_result, "total_time", float("nan"))),
+                    ik_time_s=_safe_float(getattr(plan_result, "ik_time", float("nan"))),
+                    graph_time_s=_safe_float(getattr(plan_result, "graph_time", float("nan"))),
+                    trajopt_time_s=_safe_float(getattr(plan_result, "trajopt_time", float("nan"))),
+                    used_graph=bool(getattr(plan_result, "used_graph", False)),
+                    escape_retract=is_escape_retract,
+                    world_representation=active_world_representation,
+                    target_position=active_goal_position,
+                    error="",
+                )
                 print(
                     f"[diag step={step_index}] plan#{active_plan_request_id} "
                     f"{'SUCCESS' if success else 'FAILED'} status={_result_status}",
@@ -2710,6 +3148,36 @@ def main() -> None:
             elif plan_status == "error":
                 carb.log_warn(f"Planner threw an exception: {plan_result}")
                 print(f"[diag step={step_index}] plan#{active_plan_request_id} EXCEPTION: {plan_result}", flush=True)
+                active_world_representation = (
+                    "superquadrics"
+                    if has_superquadrics and bool(collision_world.superquadric)
+                    else "mesh"
+                )
+                wall_time_s = (
+                    _safe_float(time.perf_counter() - active_plan_start_time)
+                    if active_plan_start_time > 0.0
+                    else float("nan")
+                )
+                append_plan_time_log(
+                    log_path=timing_log_path,
+                    session_stamp=timing_session_stamp,
+                    plan_id=active_plan_request_id,
+                    step_index=step_index,
+                    status="error",
+                    success=None,
+                    plan_status="EXCEPTION",
+                    attempts=float("nan"),
+                    wall_time_s=wall_time_s,
+                    total_time_s=float("nan"),
+                    ik_time_s=float("nan"),
+                    graph_time_s=float("nan"),
+                    trajopt_time_s=float("nan"),
+                    used_graph=False,
+                    escape_retract=False,
+                    world_representation=active_world_representation,
+                    target_position=active_goal_position,
+                    error=str(plan_result),
+                )
                 if "out of memory" in str(plan_result).lower():
                     torch.cuda.empty_cache()
                     backoff_steps = max(effective_plan_cooldown_steps, 120)
@@ -2735,6 +3203,49 @@ def main() -> None:
             active_plan_start_js = None
             active_goal_position = None
             active_goal_orientation = None
+
+        # ---- trace SDF values and derivatives while pursuing a target -------
+        trace_interval = max(int(args.sdf_trace_log_interval), 1)
+        if (step_index - last_sdf_trace_log_step) >= trace_interval:
+            trace_planning = plan_thread is not None
+            trace_executing = cmd_plan is not None
+            if trace_planning or trace_executing:
+                if trace_planning and trace_executing:
+                    trace_phase = "planning_and_executing"
+                elif trace_planning:
+                    trace_phase = "planning"
+                else:
+                    trace_phase = "executing"
+
+                trace_target_pos = active_goal_position if active_goal_position is not None else cube_position
+                if auto_cube_positions is not None and auto_target_idx >= 0:
+                    trace_target_id = f"auto_{auto_target_idx}"
+                else:
+                    trace_target_id = (
+                        f"manual_{_safe_float(trace_target_pos[0]):.3f}_"
+                        f"{_safe_float(trace_target_pos[1]):.3f}_"
+                        f"{_safe_float(trace_target_pos[2]):.3f}"
+                    )
+                trace_world_representation = (
+                    "superquadrics"
+                    if has_superquadrics and bool(collision_world.superquadric)
+                    else "mesh"
+                )
+                trace_plan_id = active_plan_request_id if active_plan_request_id >= 0 else plan_request_id
+
+                append_sdf_trace_log(
+                    log_path=sdf_trace_log_path,
+                    session_stamp=timing_session_stamp,
+                    step_index=step_index,
+                    phase=trace_phase,
+                    plan_id=trace_plan_id,
+                    target_id=trace_target_id,
+                    target_position=trace_target_pos,
+                    world_representation=trace_world_representation,
+                    motion_gen=motion_gen,
+                    cu_js=cu_js,
+                )
+                last_sdf_trace_log_step = step_index
 
         # ---- trigger a new plan asynchronously when target is stable -------
         planning_active = plan_thread is not None
