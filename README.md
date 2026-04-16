@@ -26,6 +26,7 @@ The pipeline has three components:
 6. [CUDA Kernel API](#cuda-kernel-api)
 7. [Integration Demo CLI Reference](#integration-demo-cli-reference)
 8. [Architecture](#architecture)
+9. [Superquadric SDF Math](#superquadric-sdf-math)
 
 ---
 
@@ -153,6 +154,121 @@ The SDF uses two regimes:
 - **Outside** (`F ≥ 1`): Taubin first-order approximation for fast evaluation.
 - **Inside** (`F < 1`): Newton radial projection — finds λ such that
   `F(λ·p_local) = 1`, giving smooth gradients near and inside obstacles.
+
+## Superquadric SDF Math
+
+This section documents the exact formulas used in the active CUDA kernel.
+
+The active file used by Python CuRobo wrappers is:
+`curobo/src/curobo/curobolib/cpp/superquadric_radial_distance_kernel.cu`.
+
+For a query sphere center `p_world = (px, py, pz)` and radius `r`:
+
+1. Transform to SQ local frame using inverse quaternion rotation:
+
+    `p_local = (x, y, z) = R_world_to_local * (p_world - c)`
+
+2. Define normalized magnitudes:
+
+    `ax = |x|/sx, ay = |y|/sy, az = |z|/sz`
+
+3. Superquadric implicit function:
+
+    `p1 = 2/eps1, p2 = 2/eps2, er = eps2/eps1`
+
+    `F(x,y,z) = (ax^p2 + ay^p2)^er + az^p1`
+
+    Surface is `F = 1`, outside is `F > 1`, inside is `F < 1`.
+
+#### Outside distance (Taubin first-order approximation)
+
+The raw sphere-vs-SQ signed distance in kernel sign convention
+(positive outside, negative inside) is:
+
+`d_raw_out ~= (F - 1)/||gradF|| - r`
+
+with local gradient:
+
+`gradF = (dF/dx, dF/dy, dF/dz)`
+
+`dF/dx = (2/eps1) * (1/sx) * sign(x) * (ax^p2 + ay^p2)^(er - 1) * ax^(p2 - 1)`
+
+`dF/dy = (2/eps1) * (1/sy) * sign(y) * (ax^p2 + ay^p2)^(er - 1) * ay^(p2 - 1)`
+
+`dF/dz = (2/eps1) * (1/sz) * sign(z) * az^(p1 - 1)`
+
+and `||gradF|| = sqrt((dF/dx)^2 + (dF/dy)^2 + (dF/dz)^2)`.
+
+The implementation then applies conservative lower bounds and returns:
+
+`d_raw = max(d_raw_out, lb_sphere, lb_aabb)`
+
+where:
+
+- `lb_sphere = ||p_world - c|| - max(sx,sy,sz) - r`
+- `lb_aabb = ||max(|p_local| - (sx,sy,sz), 0)||_2 - r`
+
+#### Inside distance (Newton radial projection)
+
+For `F < 1`, the kernel avoids flat-cost behavior by solving for `lambda` such
+that:
+
+`F(lambda * p_local) = 1`
+
+Newton iteration:
+
+`lambda_{k+1} = lambda_k - (F(lambda_k p_local) - 1) / (gradF(lambda_k p_local) dot p_local)`
+
+with initialization:
+
+`lambda_0 = max(1, F_init^(-eps1/2))`
+
+and the inside signed distance:
+
+`d_raw_in = (1 - lambda) * ||p_local|| - r`
+
+Special case near the SQ center (`||p_local|| < 1e-6`) returns
+`-min(sx,sy,sz) - r`.
+
+#### Analytical normal and world-frame gradient direction
+
+The unit outward normal is computed in local frame and rotated to world frame:
+
+`n_local = gradF / ||gradF||`
+
+`n_world = R_local_to_world * n_local`
+
+- Outside path: `gradF` is evaluated at the query point.
+- Inside path: `gradF` is evaluated at the converged surface point
+  `lambda * p_local`.
+
+#### CuRobo sign convention and collision-cost gradient
+
+The kernel distance uses `d_raw > 0` outside. CuRobo uses the opposite sign:
+
+`sdf_curobo = -d_raw`
+
+so `sdf_curobo > 0` means penetration.
+
+Collision cost per obstacle uses a smooth quadratic-linear activation with
+activation distance `a`:
+
+- `cost = 0`, if `sdf <= 0`
+- `cost = 0.5/a * sdf^2`, if `0 < sdf <= a`
+- `cost = sdf - 0.5*a`, if `sdf > a`
+
+Its derivative w.r.t. `sdf` is:
+
+- `cost' = 0`, if `sdf <= 0`
+- `cost' = sdf/a`, if `0 < sdf <= a`
+- `cost' = 1`, if `sdf > a`
+
+Given outward normal `n_world`, the position gradient used by autograd is:
+
+`d(cost)/d(p_world) = -weight * cost'(sdf_curobo) * n_world`
+
+For sum-collisions mode, this is summed over all obstacles; for min-distance
+mode, it uses the closest obstacle normal.
 
 #### `curobo/src/curobolib/cpp/superquadric_distance_kernel.cu` *(legacy, not compiled)*
 
