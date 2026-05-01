@@ -27,8 +27,10 @@ struct __align__(16) SQData {
     float sx, sy, sz;      // semi-axes
     float eps1, eps2;      // shape exponents
     float qw, qx, qy, qz; // orientation quaternion (local←world)
+    float hx, hy, hz;     // world-frame AABB half-extents (precomputed in pack_env_sq)
+    float _pad;            // padding to 64 bytes
 };
-static_assert(sizeof(SQData) == 48, "SQData must be 48 bytes");
+static_assert(sizeof(SQData) == 64, "SQData must be 64 bytes");
 
 /* ═══════════════════════════ Device helpers ════════════════════════════════ */
 
@@ -73,6 +75,24 @@ void rotate_by_quat_fwd(
 }
 
 
+/* sq_aabb_miss: broad-phase rejection using the precomputed world-frame AABB.
+ *
+ * hx/hy/hz are stored in SQData (precomputed by pack_env_sq from the rotation
+ * matrix absolute values: h_i = Σ_j |R_ij| · s_j).  Conservative for all eps.
+ *
+ * Returns true when a sphere (center px,py,pz; reach = sphere_radius + margin)
+ * is provably outside the AABB and the sq_sdf call can be skipped safely.
+ * Only used in cost-accumulation kernels where zero-cost pairs are skippable;
+ * NOT used in min-distance kernels (they need the full ESDF field). */
+__device__ __forceinline__
+bool sq_aabb_miss(const float px, const float py, const float pz,
+                  const float reach, const SQData& sq)
+{
+    return fmaxf(fabsf(px - sq.cx) - sq.hx,
+                 fmaxf(fabsf(py - sq.cy) - sq.hy,
+                       fabsf(pz - sq.cz) - sq.hz)) > reach;
+}
+
 /* ═══════════════════════════ Newton radial solve ════════════════════════════
  *
  * For points INSIDE the SQ (F < 1), the Taubin approximation and lb_box both
@@ -111,7 +131,6 @@ float sq_newton_lambda(
     // For λ inside (F < 1) this gives λ > 1, landing near the surface.
     float lambda = fmaxf(1.f, __powf(fmaxf(F_init, 1e-30f), -0.5f * sq.eps1));
 
-    #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const float qx = lambda * lx;
         const float qy = lambda * ly;
@@ -141,8 +160,10 @@ float sq_newton_lambda(
         const float gy = c * __frcp_rn(sq.sy) * sy_sign * ps * __expf((p2 - 1.f) * lay);
         const float gz = c * __frcp_rn(sq.sz) * sz_sign       * __expf((p1 - 1.f) * laz);
 
-        const float df = fmaf(gx, lx, fmaf(gy, ly, gz * lz));
-        lambda -= (F - 1.f) / (df + 1e-8f);
+        const float df    = fmaf(gx, lx, fmaf(gy, ly, gz * lz));
+        const float delta = -(F - 1.f) / (df + 1e-8f);
+        lambda += delta;
+        if (fabsf(delta) < 1e-4f) break;
     }
 
     return lambda;
@@ -165,7 +186,6 @@ float sq_newton_lambda_and_surf_grad(
 
     float lambda = fmaxf(1.f, __powf(fmaxf(F_init, 1e-30f), -0.5f * sq.eps1));
 
-    #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const float qx = lambda * lx;
         const float qy = lambda * ly;
@@ -195,8 +215,10 @@ float sq_newton_lambda_and_surf_grad(
         surf_gy = c * __frcp_rn(sq.sy) * sy_sign * ps * __expf((p2 - 1.f) * lay);
         surf_gz = c * __frcp_rn(sq.sz) * sz_sign       * __expf((p1 - 1.f) * laz);
 
-        const float df = fmaf(surf_gx, lx, fmaf(surf_gy, ly, surf_gz * lz));
-        lambda -= (F - 1.f) / (df + 1e-8f);
+        const float df    = fmaf(surf_gx, lx, fmaf(surf_gy, ly, surf_gz * lz));
+        const float delta = -(F - 1.f) / (df + 1e-8f);
+        lambda += delta;
+        if (fabsf(delta) < 1e-4f) break;
     }
 
     /* One extra forward pass at the final λ for an accurate surface gradient. */
@@ -410,10 +432,11 @@ float sq_sdf_and_normal(
 
 /* ═══════════════════════════ CUDA kernels ══════════════════════════════════ */
 
-static constexpr int BLOCK   = 128;   // threads per block
-static constexpr int SQ_TILE = 32;    // SQs loaded into shared memory per tile
-                                       // must satisfy SQ_TILE ≤ BLOCK
-static constexpr float MIN_RADIUS = 1e-2f;  // Avoid degenerate SQ axes
+static constexpr int BLOCK          = 128;  // threads per block
+static constexpr int SQ_TILE        = 64;   // SQs per tile for min-distance kernels
+static constexpr int WARP_SZ        = 32;   // warp size (CUDA architecture constant)
+static constexpr int WARPS_PER_BLOCK = BLOCK / WARP_SZ;  // 4
+static constexpr float MIN_RADIUS   = 1e-2f;  // Avoid degenerate SQ axes
 
 /* ── Kernel A: minimum raw distance over all obstacles ──────────────────────
  *
@@ -456,10 +479,10 @@ void sphere_sq_min_kernel(
 
         if (valid) {
             const int tile_end = min(SQ_TILE, n_obs - base);
-            /* Unroll hint; compiler may partially unroll the inner loop */
-            #pragma unroll 4
-            for (int j = 0; j < tile_end; ++j)
+            for (int j = 0; j < tile_end; ++j) {
+                if (sh[j]._pad == 0.f) continue;
                 min_d = fminf(min_d, sq_sdf(px, py, pz, pr, sh[j]));
+            }
         }
         __syncthreads();
     }
@@ -516,8 +539,8 @@ void sphere_sq_min_and_grad_kernel(
 
         if (valid) {
             const int tile_end = min(SQ_TILE, n_obs - base);
-            #pragma unroll 4
             for (int j = 0; j < tile_end; ++j) {
+                if (sh[j]._pad == 0.f) continue;
                 float wnx, wny, wnz;
                 const float d = sq_sdf_and_normal(px, py, pz, pr, sh[j],
                                                   wnx, wny, wnz);
@@ -540,9 +563,16 @@ void sphere_sq_min_and_grad_kernel(
 
 /* ── Kernel B: sum of smoothed collision costs over all obstacles ────────────
  *
- * Folds the collision_cost_from_sdf function into the kernel to avoid an
- * extra torch kernel launch in the sum-collisions path.
- * Weight is applied in the C++ wrapper to keep the kernel generic.
+ * Warp-per-sphere design: each warp of WARP_SZ=32 threads handles ONE sphere.
+ * Lanes within the warp each evaluate a different subset of SQs (stride=WARP_SZ),
+ * then the partial costs are summed via warp-shuffle reduction. This exposes
+ * n_obs-way parallelism instead of serialising SQs per thread, which reduces
+ * the sequential loop from n_obs iterations to ceil(n_obs/WARP_SZ) iterations.
+ *
+ * All BLOCK=128 threads cooperatively load BLOCK SQs into shared memory
+ * (vs. only 64 of 128 threads in the old SQ_TILE=64 scheme).
+ *
+ * Launch: grid = ceil(n_spheres / WARPS_PER_BLOCK), block = BLOCK.
  */
 __global__
 void sphere_sq_sum_cost_kernel(
@@ -551,40 +581,41 @@ void sphere_sq_sum_cost_kernel(
     float*        __restrict__ out_cost,  // [n_spheres]  (unweighted)
     const int     n_spheres,
     const int     n_obs,
-    const float   act_dist)               // activation distance scalar (≥ 0)
+    const float   act_dist)
 {
-    __shared__ SQData sh[SQ_TILE];
+    __shared__ SQData sh[BLOCK];  // 128 × 64 bytes = 8 KB
 
-    const int tid    = threadIdx.x;
-    const int gid    = blockIdx.x * BLOCK + tid;
-    const bool valid = (gid < n_spheres);
+    const int tid     = threadIdx.x;
+    const int warp_id = tid / WARP_SZ;
+    const int lane    = tid & (WARP_SZ - 1);
+    const int gid     = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    const bool valid  = (gid < n_spheres);
 
-    float px = 0.f, py = 0.f, pz = 0.f, pr = 0.f;
+    float px = 0.f, py = 0.f, pz = 0.f, pr = -1.f;
     if (valid) {
         const float4 s = __ldg(reinterpret_cast<const float4*>(spheres) + gid);
-        if (s.w < 0.f) { out_cost[gid] = 0.f; return; }    // disabled sphere
         px = s.x; py = s.y; pz = s.z; pr = s.w;
     }
 
-    float total = 0.f;
+    const bool active = valid && (pr >= 0.f);
+    float partial = 0.f;
 
-    for (int base = 0; base < n_obs; base += SQ_TILE) {
-        if (tid < SQ_TILE) {
-            const int load_i = base + tid;
-            if (load_i < n_obs)
-                sh[tid] = sq_arr[load_i];
-        }
+    for (int base = 0; base < n_obs; base += BLOCK) {
+        /* All BLOCK threads load BLOCK SQ descriptors cooperatively */
+        const int load_i = base + tid;
+        if (load_i < n_obs)
+            sh[tid] = sq_arr[load_i];
         __syncthreads();
 
-        if (valid) {
-            const int tile_end = min(SQ_TILE, n_obs - base);
-            #pragma unroll 4
-            for (int j = 0; j < tile_end; ++j) {
-                /* Negate: positive = penetrating (CuRobo convention) */
+        if (active) {
+            const int tile_end = min(BLOCK, n_obs - base);
+            /* Each lane handles SQs: lane, lane+WARP_SZ, lane+2*WARP_SZ, ... */
+            for (int j = lane; j < tile_end; j += WARP_SZ) {
+                if (sh[j]._pad == 0.f) continue;
+                if (sq_aabb_miss(px, py, pz, pr, sh[j])) continue;
                 const float sdf = -sq_sdf(px, py, pz, pr, sh[j]);
                 if (sdf > 0.f) {
-                    /* Smooth quadratic–linear collision cost */
-                    total += (act_dist > 0.f)
+                    partial += (act_dist > 0.f)
                         ? ((sdf > act_dist)
                             ? sdf - 0.5f * act_dist
                             : (0.5f / act_dist) * sdf * sdf)
@@ -595,22 +626,28 @@ void sphere_sq_sum_cost_kernel(
         __syncthreads();
     }
 
-    if (valid)
-        out_cost[gid] = total;
+    /* Warp-level reduction: sum partial costs from all 32 lanes */
+    partial += __shfl_down_sync(0xffffffff, partial, 16);
+    partial += __shfl_down_sync(0xffffffff, partial,  8);
+    partial += __shfl_down_sync(0xffffffff, partial,  4);
+    partial += __shfl_down_sync(0xffffffff, partial,  2);
+    partial += __shfl_down_sync(0xffffffff, partial,  1);
+
+    if (lane == 0 && valid)
+        out_cost[gid] = partial;
 }
 
 /* ── Kernel B2: sum-of-costs + accumulated analytical gradient ───────────────
  *
- * Computes both the total collision cost (same as sphere_sq_sum_cost_kernel)
- * and its gradient w.r.t. sphere position:
- *   ∂(Σ cost_i)/∂p = Σ cost'_i * ∂sdf_i/∂p = Σ cost'_i * (-n̂_i)
- *
- * out_grad accumulates: Σ cost'_i * n̂_i  (positive outward direction).
- * The C++ wrapper negates and scales by weight.
+ * Same warp-per-sphere design as sphere_sq_sum_cost_kernel.
+ * Each lane also accumulates a partial normal vector (sum_gnx/y/z), which is
+ * reduced across the warp with four independent __shfl_down_sync chains.
  *
  * cost'(sdf) = 0          if sdf ≤ 0
  *            = sdf/act    if 0 < sdf ≤ act_dist   (quadratic region)
  *            = 1          if sdf > act_dist        (linear region)
+ *
+ * Launch: grid = ceil(n_spheres / WARPS_PER_BLOCK), block = BLOCK.
  */
 __global__
 void sphere_sq_sum_cost_and_grad_kernel(
@@ -622,55 +659,51 @@ void sphere_sq_sum_cost_and_grad_kernel(
     const int     n_obs,
     const float   act_dist)
 {
-    __shared__ SQData sh[SQ_TILE];
+    __shared__ SQData sh[BLOCK];
 
-    const int tid    = threadIdx.x;
-    const int gid    = blockIdx.x * BLOCK + tid;
-    const bool valid = (gid < n_spheres);
+    const int tid     = threadIdx.x;
+    const int warp_id = tid / WARP_SZ;
+    const int lane    = tid & (WARP_SZ - 1);
+    const int gid     = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    const bool valid  = (gid < n_spheres);
 
-    float px = 0.f, py = 0.f, pz = 0.f, pr = 0.f;
+    float px = 0.f, py = 0.f, pz = 0.f, pr = -1.f;
     if (valid) {
         const float4 s = __ldg(reinterpret_cast<const float4*>(spheres) + gid);
-        if (s.w < 0.f) {
-            out_cost[gid] = 0.f;
-            out_grad[gid] = make_float4(0.f, 0.f, 0.f, 0.f);
-            return;
-        }
         px = s.x; py = s.y; pz = s.z; pr = s.w;
     }
 
-    float total   = 0.f;
+    const bool active = valid && (pr >= 0.f);
+    float partial = 0.f;
     float sum_gnx = 0.f, sum_gny = 0.f, sum_gnz = 0.f;
 
-    for (int base = 0; base < n_obs; base += SQ_TILE) {
-        if (tid < SQ_TILE) {
-            const int load_i = base + tid;
-            if (load_i < n_obs)
-                sh[tid] = sq_arr[load_i];
-        }
+    for (int base = 0; base < n_obs; base += BLOCK) {
+        const int load_i = base + tid;
+        if (load_i < n_obs)
+            sh[tid] = sq_arr[load_i];
         __syncthreads();
 
-        if (valid) {
-            const int tile_end = min(SQ_TILE, n_obs - base);
-            #pragma unroll 4
-            for (int j = 0; j < tile_end; ++j) {
+        if (active) {
+            const int tile_end = min(BLOCK, n_obs - base);
+            for (int j = lane; j < tile_end; j += WARP_SZ) {
+                if (sh[j]._pad == 0.f) continue;
+                if (sq_aabb_miss(px, py, pz, pr, sh[j])) continue;
                 float wnx, wny, wnz;
-                /* sdf_curobo = -raw: positive = collision */
                 const float sdf = -sq_sdf_and_normal(px, py, pz, pr, sh[j],
                                                      wnx, wny, wnz);
                 if (sdf > 0.f) {
                     float cost_d;
                     if (act_dist > 0.f) {
                         if (sdf > act_dist) {
-                            total  += sdf - 0.5f * act_dist;
-                            cost_d  = 1.f;
+                            partial += sdf - 0.5f * act_dist;
+                            cost_d   = 1.f;
                         } else {
-                            total  += (0.5f / act_dist) * sdf * sdf;
-                            cost_d  = sdf / act_dist;
+                            partial += (0.5f / act_dist) * sdf * sdf;
+                            cost_d   = sdf / act_dist;
                         }
                     } else {
-                        total  += sdf;
-                        cost_d  = 1.f;
+                        partial += sdf;
+                        cost_d   = 1.f;
                     }
                     sum_gnx += cost_d * wnx;
                     sum_gny += cost_d * wny;
@@ -681,8 +714,33 @@ void sphere_sq_sum_cost_and_grad_kernel(
         __syncthreads();
     }
 
-    if (valid) {
-        out_cost[gid] = total;
+    /* Warp-level reduction across all four accumulators */
+    partial  += __shfl_down_sync(0xffffffff, partial,  16);
+    partial  += __shfl_down_sync(0xffffffff, partial,   8);
+    partial  += __shfl_down_sync(0xffffffff, partial,   4);
+    partial  += __shfl_down_sync(0xffffffff, partial,   2);
+    partial  += __shfl_down_sync(0xffffffff, partial,   1);
+
+    sum_gnx  += __shfl_down_sync(0xffffffff, sum_gnx,  16);
+    sum_gnx  += __shfl_down_sync(0xffffffff, sum_gnx,   8);
+    sum_gnx  += __shfl_down_sync(0xffffffff, sum_gnx,   4);
+    sum_gnx  += __shfl_down_sync(0xffffffff, sum_gnx,   2);
+    sum_gnx  += __shfl_down_sync(0xffffffff, sum_gnx,   1);
+
+    sum_gny  += __shfl_down_sync(0xffffffff, sum_gny,  16);
+    sum_gny  += __shfl_down_sync(0xffffffff, sum_gny,   8);
+    sum_gny  += __shfl_down_sync(0xffffffff, sum_gny,   4);
+    sum_gny  += __shfl_down_sync(0xffffffff, sum_gny,   2);
+    sum_gny  += __shfl_down_sync(0xffffffff, sum_gny,   1);
+
+    sum_gnz  += __shfl_down_sync(0xffffffff, sum_gnz,  16);
+    sum_gnz  += __shfl_down_sync(0xffffffff, sum_gnz,   8);
+    sum_gnz  += __shfl_down_sync(0xffffffff, sum_gnz,   4);
+    sum_gnz  += __shfl_down_sync(0xffffffff, sum_gnz,   2);
+    sum_gnz  += __shfl_down_sync(0xffffffff, sum_gnz,   1);
+
+    if (lane == 0 && valid) {
+        out_cost[gid] = partial;
         out_grad[gid] = make_float4(sum_gnx, sum_gny, sum_gnz, 0.f);
     }
 }
@@ -698,13 +756,16 @@ static int clamp_env(int e, int maxe)
 
 /* ── pack_env_sq ─────────────────────────────────────────────────────────────
  *
- * Select enabled obstacles for one environment and repack them into
- * SQData layout [cx,cy,cz,sx,sy,sz,eps1,eps2] (from input layout
- * [sx,sy,sz,eps1,eps2,cx,cy,cz]).  Clamping is applied here once, not
- * inside every kernel invocation.
+ * Repack SQ parameters for one environment into the SQData layout required by
+ * the CUDA kernels.  All max_nobs slots are always packed (fixed output size),
+ * which avoids mask.nonzero() and makes this function compatible with CUDA
+ * graph capture.  Disabled SQs get _pad=0.0 (col 15) so kernels can skip them
+ * with a single float comparison before doing any expensive work.
  *
- * Returns a contiguous float32 GPU tensor of shape [n_obs, 8].
- * Returns an empty tensor if no obstacles are enabled.
+ * Input layout:  [sx,sy,sz, eps1,eps2, cx,cy,cz, qx,qy,qz,qw]
+ * Output layout: cx,cy,cz, sx,sy,sz, eps1,eps2, qw,qx,qy,qz, hx,hy,hz, _pad
+ *
+ * Returns a contiguous float32 GPU tensor of shape [max_nobs, 16].
  */
 torch::Tensor pack_env_sq(
     const torch::Tensor& sq_params,
@@ -715,37 +776,57 @@ torch::Tensor pack_env_sq(
                         .dtype(torch::kFloat)
                         .device(sq_params.device());
 
-    const auto raw  = sq_params[env_idx];
-    const auto mask = enabled_mask[env_idx];
+    const int max_nobs = (int)sq_params.size(1);
+    if (max_nobs == 0)
+        return torch::empty({0, 16}, dev_opts);
 
-    const auto idx_2d = mask.nonzero();
-    if (idx_2d.size(0) == 0)
-        return torch::empty({0, 12}, dev_opts);  // Bug 3 fix: was {0,8}
+    const auto raw  = sq_params[env_idx].to(torch::kFloat);        // [max_nobs, 12]
+    const auto mask = enabled_mask[env_idx].to(torch::kFloat)      // [max_nobs, 1]
+                          .unsqueeze(1);
 
-    const auto idx = idx_2d.squeeze(1);
-    const auto sel = raw.index_select(0, idx)
-                        .to(torch::kFloat)
-                        .contiguous();
+    auto out = torch::zeros({max_nobs, 16}, dev_opts);
 
-    // Input layout: [sx,sy,sz, eps1,eps2, cx,cy,cz, qx,qy,qz,qw]
-    // (Python stores quaternion as [qx,qy,qz,qw]; SQData expects [qw,qx,qy,qz])
-    const int64_t n_obs = idx.size(0);
-    auto out = torch::empty({n_obs, 12}, dev_opts);
-
-    out.slice(1, 0, 3).copy_(sel.slice(1, 5, 8));   // cx,cy,cz
+    // cx, cy, cz — zero for disabled SQs
+    out.slice(1, 0, 3).copy_(raw.slice(1, 5, 8) * mask);
+    // sx, sy, sz — clamped, then zeroed for disabled SQs
     out.slice(1, 3, 6).copy_(
-        torch::clamp(torch::abs(sel.slice(1, 0, 3)), MIN_RADIUS));  // sx,sy,sz
+        torch::clamp(torch::abs(raw.slice(1, 0, 3)), MIN_RADIUS) * mask);
+    // eps1, eps2
+    const auto mask1 = mask.select(1, 0);
     out.select(1, 6).copy_(
-        torch::clamp(torch::abs(sel.select(1, 3)), 0.05f, 4.0f));   // eps1
+        torch::clamp(torch::abs(raw.select(1, 3)), 0.05f, 4.0f) * mask1);
     out.select(1, 7).copy_(
-        torch::clamp(torch::abs(sel.select(1, 4)), 0.05f, 4.0f));   // eps2
+        torch::clamp(torch::abs(raw.select(1, 4)), 0.05f, 4.0f) * mask1);
 
-    // Quaternion — normalise and reorder [qx,qy,qz,qw] → [qw,qx,qy,qz] for SQData
-    auto q      = sel.slice(1, 8, 12).to(torch::kFloat);
+    // Quaternion: normalise and reorder [qx,qy,qz,qw] → [qw,qx,qy,qz]
+    auto q      = raw.slice(1, 8, 12);
     auto q_norm = torch::clamp(torch::norm(q, 2, 1, true), 1e-6f);
-    auto q_n    = (q / q_norm).contiguous();
-    out.select(1, 8).copy_(q_n.select(1, 3));    // qw  (was at index 3)
-    out.slice(1, 9, 12).copy_(q_n.slice(1, 0, 3));  // qx,qy,qz (were at 0,1,2)
+    auto q_n    = (q / q_norm * mask).contiguous();
+    out.select(1,  8).copy_(q_n.select(1, 3));       // qw
+    out.slice(1,  9, 12).copy_(q_n.slice(1, 0, 3));  // qx,qy,qz
+
+    // World-frame AABB half-extents: h_i = Σ_j |R_ij| · s_j
+    const auto qw  = out.select(1,  8);
+    const auto qx  = out.select(1,  9);
+    const auto qy  = out.select(1, 10);
+    const auto qz  = out.select(1, 11);
+    const auto sx  = out.select(1,  3);
+    const auto sy  = out.select(1,  4);
+    const auto sz  = out.select(1,  5);
+    const auto qx2 = qx * qx, qy2 = qy * qy, qz2 = qz * qz;
+    out.select(1, 12).copy_(
+        (1.f - 2.f * (qy2 + qz2)).abs() * sx +
+        (2.f * (qx * qy - qw * qz)).abs() * sy +
+        (2.f * (qx * qz + qw * qy)).abs() * sz);   // hx
+    out.select(1, 13).copy_(
+        (2.f * (qx * qy + qw * qz)).abs() * sx +
+        (1.f - 2.f * (qx2 + qz2)).abs() * sy +
+        (2.f * (qy * qz - qw * qx)).abs() * sz);   // hy
+    out.select(1, 14).copy_(
+        (2.f * (qx * qz - qw * qy)).abs() * sx +
+        (2.f * (qy * qz + qw * qx)).abs() * sy +
+        (1.f - 2.f * (qx2 + qy2)).abs() * sz);     // hz
+    out.select(1, 15).copy_(mask1);                  // _pad = enabled flag
 
     return out.contiguous();
 }
@@ -801,15 +882,18 @@ torch::Tensor evaluate_all_sq(
     auto values = compute_esdf ? torch::full({q}, -1e6f, opt)
                                : torch::zeros({q}, opt);
 
-    /* ── Pack enabled SQ descriptors for this environment ────────────── */
+    /* ── Pack SQ descriptors for this environment (fixed [max_nobs,16] size) ── */
     const auto sq_packed = pack_env_sq(sq_params, enabled_mask, cenv);
-    const int n_obs = (int)sq_packed.size(0);
+    const int n_obs = (int)sq_packed.size(0);   // = max_nobs; disabled SQs have _pad=0
     if (n_obs == 0)
         return values;
 
     auto raw = torch::empty({q}, opt);    // kernel output buffer
 
-    const int blocks   = ((int)q + BLOCK - 1) / BLOCK;
+    /* min-distance kernels: 1 thread per sphere */
+    const int blocks       = ((int)q + BLOCK          - 1) / BLOCK;
+    /* cost kernels: 1 warp (WARP_SZ threads) per sphere */
+    const int cost_blocks  = ((int)q + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
     const auto* sq_ptr = reinterpret_cast<const SQData*>(sq_packed.data_ptr<float>());
     const float* sp    = query_spheres.data_ptr<float>();
 
@@ -821,7 +905,7 @@ torch::Tensor evaluate_all_sq(
 
     /* ════ Sum-collisions path ════════════════════════════════════════ */
     if (sum_collisions && !compute_esdf) {
-        sphere_sq_sum_cost_kernel<<<blocks, BLOCK, 0, stream>>>(
+        sphere_sq_sum_cost_kernel<<<cost_blocks, BLOCK, 0, stream>>>(
             sp, sq_ptr, raw.data_ptr<float>(), (int)q, n_obs, ad);
 
         /* raw = unweighted sum-of-costs for all spheres; zero out off-env */
@@ -969,10 +1053,11 @@ torch::Tensor evaluate_all_sq_grad(
     const auto env_mask_f = (query_env_idx == (int64_t)cenv).to(opt.dtype());
 
     const auto sq_packed = pack_env_sq(sq_params, enabled_mask, cenv);
-    const int  n_obs     = (int)sq_packed.size(0);
+    const int  n_obs     = (int)sq_packed.size(0);   // = max_nobs; _pad flags disabled SQs
     if (n_obs == 0) return grad;
 
-    const int    blocks = ((int)q + BLOCK - 1) / BLOCK;
+    const int    blocks      = ((int)q + BLOCK          - 1) / BLOCK;
+    const int    cost_blocks = ((int)q + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
     const auto*  sq_ptr = reinterpret_cast<const SQData*>(sq_packed.data_ptr<float>());
     const float* sp     = query_spheres.data_ptr<float>();
 
@@ -986,7 +1071,7 @@ torch::Tensor evaluate_all_sq_grad(
 
     if (sum_collisions && !compute_esdf) {
         /* ── Sum path: accumulate Σ cost'_i * n̂_i ─────────────────────── */
-        sphere_sq_sum_cost_and_grad_kernel<<<blocks, BLOCK, 0, stream>>>(
+        sphere_sq_sum_cost_and_grad_kernel<<<cost_blocks, BLOCK, 0, stream>>>(
             sp, sq_ptr,
             raw_dist.data_ptr<float>(),
             reinterpret_cast<float4*>(raw_grad.data_ptr<float>()),

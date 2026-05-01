@@ -179,14 +179,9 @@ class PRMStar(GraphPlanBase):
                 c_max[idx] = c_max_t[i]
                 c_max_all[idx] = c_max_t[i]
 
-            s_new_path = []
-
-            # only take paths that are valid:
-            for g_i, g_p in enumerate(s_path):
-                if exist_label[g_i]:
-                    s_new_path.append(g_p)
-            s_path = s_new_path
             if len_min <= 2:
+                # s_path has n_seeds entries (trivial [x,x] for failed seeds, real paths
+                # for successful ones) — keep all so result.plan aligns with result.success.
                 paths = self.get_paths(s_path)
                 result.plan = paths
                 result.success = exist_label
@@ -263,12 +258,9 @@ class PRMStar(GraphPlanBase):
                 for i, idx in enumerate(idx_list):
                     s_path[idx] = path_list[i]
                     c_max[idx] = c_list[i]
-            g_path = []
-
-            # only take paths that are valid:
-            for g_i, g_p in enumerate(s_path):
-                if exist_label[g_i]:
-                    g_path.append(g_p)
+            # s_path has n_seeds entries (trivial [x,x] for failed seeds) — keep all
+            # so result.plan length aligns with result.success.
+            g_path = s_path
         else:
             g_path, c_max = self.batch_get_graph_shortest_path(
                 batch_start_idx, batch_goal_idx, return_length=True
@@ -444,13 +436,9 @@ class PRMStar(GraphPlanBase):
                 for i, idx in enumerate(idx_list):
                     s_path[idx] = path_list[i]
                     c_max[idx] = c_list[i]
-            g_path = []
-
-            # only take paths that are valid:
-            for g_i, g_p in enumerate(s_path):
-                if exist_label[g_i]:
-                    g_path.append(g_p)
-            # g_path = s_path
+            # s_path has n_seeds entries (trivial [x,x] for failed seeds) — keep all
+            # so result.plan length aligns with result.success.
+            g_path = s_path
         else:
             g_path, c_max = self.batch_get_graph_shortest_path(
                 batch_start_idx, batch_goal_idx, return_length=True

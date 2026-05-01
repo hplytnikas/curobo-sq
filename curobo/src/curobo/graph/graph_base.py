@@ -669,21 +669,38 @@ class GraphPlanBase(GraphConfig):
             path = GraphResult(success, x_init, x_goal)
             return path
         if self.interpolation_type is not None and (torch.count_nonzero(path.success) > 0):
-            (
-                path.interpolated_plan,
-                path.path_buffer_last_tstep,
-                path.optimized_dt,
-            ) = self.get_interpolated_trajectory(path.plan, interpolation_steps)
-            # path.js_interpolated_plan = self.rollout_fn.get_full_dof_from_solution(
-            #    path.interpolated_plan
-            # )
-            if self.compute_metrics:
-                # compute feasibility on interpolated plan (constraint_fn only — cost_fn may
-                # have an empty cost list in the safety rollout and is not needed here):
-                aug_state = self.safety_rollout_fn._get_augmented_state(path.interpolated_plan)
-                path.metrics = self.safety_rollout_fn.constraint_fn(aug_state)
+            try:
+                (
+                    path.interpolated_plan,
+                    path.path_buffer_last_tstep,
+                    path.optimized_dt,
+                ) = self.get_interpolated_trajectory(path.plan, interpolation_steps)
+                # path.js_interpolated_plan = self.rollout_fn.get_full_dof_from_solution(
+                #    path.interpolated_plan
+                # )
+                if self.compute_metrics:
+                    # compute feasibility on interpolated plan (constraint_fn only — cost_fn may
+                    # have an empty cost list in the safety rollout and is not needed here):
+                    aug_state = self.safety_rollout_fn._get_augmented_state(path.interpolated_plan)
+                    path.metrics = self.safety_rollout_fn.constraint_fn(aug_state)
 
-                path.success = torch.logical_and(path.success, torch.all(path.metrics.feasible, 1))
+                    feasible_per_path = torch.all(path.metrics.feasible, 1)
+                    if feasible_per_path.shape[0] == path.success.shape[0]:
+                        path.success = torch.logical_and(path.success, feasible_per_path)
+                    else:
+                        # path.plan contains only the successful paths; path.success covers all
+                        # seeds (including failures). Map feasibility back to the correct slots.
+                        success_idx = path.success.nonzero(as_tuple=False).view(-1)
+                        n = min(success_idx.shape[0], feasible_per_path.shape[0])
+                        path.success[success_idx[:n]] = torch.logical_and(
+                            path.success[success_idx[:n]], feasible_per_path[:n]
+                        )
+                        if n < success_idx.shape[0]:
+                            path.success[success_idx[n:]] = False
+            except (RuntimeError, ValueError) as e:
+                log_warn("Graph path post-processing failed, skipping feasibility refinement: " + str(e))
+                self.reset_buffer()
+                torch.cuda.empty_cache()
 
         return path
 

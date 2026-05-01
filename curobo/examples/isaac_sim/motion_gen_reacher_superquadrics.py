@@ -974,11 +974,12 @@ def _safe_float(value, default: float = float("nan")) -> float:
 def create_plan_time_log_file() -> Path:
     """Create a new per-session CSV file for planner timing metrics."""
     workspace_root = Path(__file__).resolve().parents[3]
-    logs_dir = workspace_root / "logs"
+    logs_dir = workspace_root / "logs" / "timing"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = logs_dir / f"motion_gen_superquadrics_timings_{session_stamp}.csv"
+    world_tag = args.world_representation
+    log_path = logs_dir / f"timings_{world_tag}_{session_stamp}.csv"
 
     with log_path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
@@ -1984,10 +1985,8 @@ def build_motion_gen(robot_cfg, collision_world: WorldConfig, tensor_args: Tenso
         trim_steps = [1, None]
         interpolation_dt = trajopt_dt
 
-    # The superquadric radial-distance kernel uses mask.nonzero() which produces
-    # dynamic-shaped tensors incompatible with CUDA graph stream capture.
-    # Disable CUDA graph capture globally for IK/trajopt/graph rollouts when
-    # superquadrics are in use (use_cuda_graph=False).
+    # pack_env_sq now outputs a fixed-size [max_nobs, 16] tensor (no mask.nonzero()),
+    # so CUDA graph capture is compatible with superquadrics.
     has_superquadrics = bool(collision_world.superquadric)
     superquadric_count = len(collision_world.superquadric) if has_superquadrics else 0
     interactive_mode = args.headless_mode is None
@@ -2031,7 +2030,7 @@ def build_motion_gen(robot_cfg, collision_world: WorldConfig, tensor_args: Tenso
         num_batch_ik_seeds = min(num_batch_ik_seeds, 4)
         num_trajopt_seeds = min(num_trajopt_seeds, 2)
         trajopt_tsteps = min(trajopt_tsteps, 24)
-        interpolation_steps = min(interpolation_steps, 1500)
+        interpolation_steps = min(interpolation_steps, 400)
     elif memory_profile == "low":
         num_ik_seeds = min(num_ik_seeds, 2)
         num_batch_ik_seeds = min(num_batch_ik_seeds, 2)
@@ -2099,9 +2098,9 @@ def build_motion_gen(robot_cfg, collision_world: WorldConfig, tensor_args: Tenso
     # the IK and trajopt particle optimisers (particle_opt_base._initialize_cuda_graph).
     # Setting use_cuda_graph=False disables graph capture across all solvers so
     # the superquadric kernel is called eagerly rather than inside a CUDA graph.
-    
+    # The graph planner's rollout constraint also uses CUDA graphs; the SQ path
+    # has residual dynamic-shape ops there, so keep graphs disabled for SQ.
     use_cuda_graph = not has_superquadrics
-    # use_cuda_graph = True
 
     motion_gen_config = MotionGenConfig.load_from_robot_config(
         robot_cfg,
