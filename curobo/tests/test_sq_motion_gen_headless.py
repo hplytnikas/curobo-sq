@@ -64,7 +64,7 @@ def run_gradient_descent(world, spheres_xyzr, n_steps=200, lr=0.01):
 
         dist_out = world.get_sphere_distance(
             sphere_in, q, weight, act_dist,
-            env_query_idx=env_idx, compute_esdf=False, sum_collisions=True
+            env_query_idx=env_idx, compute_esdf=True, sum_collisions=False
         )
 
         loss = dist_out.sum()
