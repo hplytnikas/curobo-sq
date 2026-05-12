@@ -6,12 +6,13 @@ library. Superquadrics enable more compact and differentiable scene
 representations than triangle meshes, and avoid the scalability issues of
 voxel grids.
 
-The pipeline has three components:
+The pipeline has four components:
 
 | Component | Directory | Role |
 |-----------|-----------|------|
 | **SuperDec** | `superdec/` | Neural network that decomposes a point cloud into superquadric primitives |
-| **CuRobo (fork)** | `curobo/` | Motion planner extended with native SQ SDF/collision kernels |
+| **CuRobo v1 (fork)** | `curobo/` | CuRobo 0.7 fork with native SQ SDF/collision kernels written in CUDA C++ |
+| **CuRobo v2 (fork)** | `curobov2/` | CuRobo v2 fork with SQ support rewritten in NVIDIA Warp (no C++ compilation) |
 | **OpenGJK** | `openGJK/` | Standalone GJK library — **not used in the planning pipeline**, kept for independent geometry validation |
 
 ---
@@ -20,13 +21,17 @@ The pipeline has three components:
 
 1. [Environment & Build](#environment--build)
 2. [Quick Start](#quick-start)
-3. [New Files Added](#new-files-added)
-4. [Python API — Superquadric Types](#python-api--superquadric-types)
-5. [Python API — Collision World](#python-api--collision-world)
-6. [CUDA Kernel API](#cuda-kernel-api)
-7. [Integration Demo CLI Reference](#integration-demo-cli-reference)
-8. [Architecture](#architecture)
+3. [CuRobo v1 — Changed Files](#curobo-v1--changed-files)
+4. [CuRobo v1 — Python API: Superquadric Types](#curobo-v1--python-api-superquadric-types)
+5. [CuRobo v1 — Python API: Collision World](#curobo-v1--python-api-collision-world)
+6. [CuRobo v1 — CUDA Kernel API](#curobo-v1--cuda-kernel-api)
+7. [CuRobo v1 — Integration Demo CLI Reference](#curobo-v1--integration-demo-cli-reference)
+8. [CuRobo v1 — Architecture](#curobo-v1--architecture)
 9. [Superquadric SDF Math](#superquadric-sdf-math)
+10. [CuRobo v2 — Changed Files](#curobo-v2--changed-files)
+11. [CuRobo v2 — Python API](#curobo-v2--python-api)
+12. [CuRobo v2 — Examples & Tests](#curobo-v2--examples--tests)
+13. [CuRobo v1 vs v2 — Comparison](#curobo-v1-vs-v2--comparison)
 
 ---
 
@@ -82,9 +87,9 @@ omni_python curobo/tests/test_sq_clpt.py
 
 ---
 
-## New Files Added
+## CuRobo v1 — Changed Files
 
-The files below were added on top of the upstream CuRobo and SuperDec
+The files below were added or modified on top of the upstream CuRobo 0.7 and SuperDec
 repositories to implement the superquadric integration.
 
 ### SuperDec
@@ -317,7 +322,7 @@ Exposes the new CUDA functions to Python via the `geom_cu` module:
 
 ---
 
-## Python API — Superquadric Types
+## CuRobo v1 — Python API: Superquadric Types
 
 ### `curobo.geom.types.Superquadric`
 
@@ -378,7 +383,7 @@ world = WorldConfig(superquadric=[sq1, sq2, sq3])
 
 ---
 
-## Python API — Collision World
+## CuRobo v1 — Python API: Collision World
 
 ### Setup
 
@@ -451,7 +456,7 @@ grad = query_buf.superquadric_collision_buffer.grad_distance_buffer
 
 ---
 
-## CUDA Kernel API
+## CuRobo v1 — CUDA Kernel API
 
 These functions are accessible as `geom_cu.closest_point_superquadric` and
 `geom_cu.swept_closest_point_superquadric` after building the extension. They
@@ -528,7 +533,7 @@ std::vector<torch::Tensor> swept_sphere_superquadric_clpt(
 
 ---
 
-## Integration Demo CLI Reference
+## CuRobo v1 — Integration Demo CLI Reference
 
 ### `motion_gen_reacher_superquadrics.py`
 
@@ -570,7 +575,7 @@ Full Isaac Sim motion generation demo with live SuperDec inference.
 
 ---
 
-## Architecture
+## CuRobo v1 — Architecture
 
 ```
 point_cloud.ply
@@ -620,3 +625,280 @@ point_cloud.ply
 **CUDA graphs** are disabled when using superquadrics (`use_cuda_graph=False`)
 because `pack_env_sq` calls `mask.nonzero()`, which produces dynamically-shaped
 tensors incompatible with CUDA graph stream capture.
+
+---
+
+## CuRobo v2 — Changed Files
+
+CuRobo v2 (`curobov2/`) replaces the custom CUDA C++ kernels from v1 with
+[NVIDIA Warp](https://github.com/NVIDIA/warp) — GPU kernels written in Python,
+compiled at runtime, with no separate build step. The SDF algorithm is
+identical (Newton radial projection + Taubin approximation), but the
+implementation and API differ significantly.
+
+No compilation step is required. Set `PYTHONPATH` to the source tree:
+
+```bash
+export PYTHONPATH=/home/haroldas/3DV/curobov2/curobo
+export PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH
+```
+
+### New files
+
+#### `curobov2/curobo/curobo/_src/geom/data/data_superquadric.py` *(new)*
+
+All Warp GPU kernels and Python tensor management for superquadric obstacles.
+
+**Warp struct exposed to kernels:**
+
+```python
+@wp.struct
+class SuperquadricDataWarp:
+    params:    wp.array2d(dtype=wp.float32)   # (num_envs*max_n, 8) → [sx,sy,sz, ε1,ε2, pad,pad,pad]
+    inv_pose:  wp.array2d(dtype=wp.float32)   # (num_envs*max_n, 8) → [x,y,z, qw,qx,qy,qz, pad]
+    enable:    wp.array(dtype=wp.uint8)        # (num_envs*max_n,) enable mask
+    n_per_env: wp.array(dtype=wp.int32)        # (num_envs,) active count per env
+    max_n:     wp.int32
+    num_envs:  wp.int32
+```
+
+**Warp SDF functions (called by the generic collision kernel via the plugin registry):**
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `is_obs_enabled` | `(obs_set, env_idx, local_idx) → wp.bool` | Enable mask lookup |
+| `load_obstacle_transform` | `(obs_set, env_idx, local_idx) → wp.transform` | Inverse pose for frame transform |
+| `compute_local_sdf` | `(obs_set, env_idx, local_idx, pt) → float32` | SDF value only |
+| `compute_local_sdf_with_grad` | `(obs_set, env_idx, local_idx, pt) → wp.vec4` | `(sdf, ∂x, ∂y, ∂z)` |
+
+**Python dataclass `SuperquadricData`:**
+
+| Method | Description |
+|--------|-------------|
+| `create_cache(max_n, num_envs, device_cfg)` | Allocate empty GPU tensors |
+| `from_scene_cfg(scene_cfg, device_cfg, ...)` | Load from a `SceneCfg` |
+| `from_batch_scene_cfg(scene_cfg_list, ...)` | Multi-environment load |
+| `add(sq, env_idx)` | Add one obstacle; returns its index |
+| `load_batch(sqs, env_idx)` | Replace all obstacles in an environment |
+| `update_pose(name, w_obj_pose, obj_w_pose, env_idx)` | In-place pose update |
+| `set_enabled(name, enabled, env_idx)` | Toggle obstacle visibility |
+| `get_idx(name, env_idx)` | Obstacle index lookup |
+| `get_active_count(env_idx)` | Number of enabled obstacles |
+| `to_warp()` | Convert to `SuperquadricDataWarp` for kernel calls |
+
+#### `curobov2/curobo/curobo/docs/guides/superquadric_obstacles.md` *(new)*
+
+Full user guide: environment setup, scene definition, collision query API,
+`SceneCollision` integration, multi-environment use, test instructions, and
+implementation notes. Canonical reference for the v2 API.
+
+---
+
+### Modified files
+
+#### `curobov2/curobo/curobo/_src/geom/types.py`
+
+**New `Superquadric` dataclass** (alongside existing `Cuboid`, `Mesh`, `Blox`):
+
+```python
+@dataclass
+class Superquadric(Obstacle):
+    radii: List[float] = field(default_factory=lambda: [0.1, 0.1, 0.1])  # [a₁, a₂, a₃]
+    shape: List[float] = field(default_factory=lambda: [1.0, 1.0])       # [ε₁, ε₂]
+
+    def get_trimesh_mesh(self) -> trimesh.Trimesh: ...  # 32×32 parametric surface
+```
+
+Note: the field is named `shape` in v2 (vs. `eps` in v1).
+
+**`SceneCfg` additions:**
+
+- New field: `superquadric: Optional[List[Superquadric]] = None`
+- `__post_init__`: appends SQs to the unified `objects` list
+- `create()`: parses `data_dict["superquadric"]` from dict/YAML
+- `add_obstacle()`: routes `Superquadric` instances correctly
+- `create_mesh_scene()`: tessellates SQs for mesh-based comparison
+- `clone()`: deep-copies the superquadric list
+
+#### `curobov2/curobo/curobo/_src/geom/data/registry.py`
+
+Added `data_superquadric` to the obstacle plugin list:
+
+```python
+OBSTACLE_SDF_MODULES = [
+    "curobo._src.geom.data.data_cuboid",
+    "curobo._src.geom.data.data_mesh",
+    "curobo._src.geom.data.data_voxel",
+    "curobo._src.geom.data.data_superquadric",   # ← added
+]
+```
+
+The generic Warp collision kernel iterates this list and dispatches to each
+module's `compute_local_sdf_with_grad`. New obstacle types can be added by
+implementing that interface and appending a module here.
+
+#### `curobov2/curobo/curobo/_src/geom/data/data_scene.py`
+
+- New field: `superquadrics: Optional[SuperquadricData] = None`
+- `create_cache(..., superquadric_cache: Optional[int] = None)` — allocates GPU buffer
+- `from_scene_cfg(...)` / `from_batch_scene_cfg(...)` — pass-through for SQ cache
+- `add_obstacle(sq)` — routes `Superquadric` to `self.superquadrics.add()`
+- `update_obstacle_pose(name, pose, env_idx)` — checks SQs if not found elsewhere
+- `enable_obstacle(name, enabled, env_idx)` — toggles SQ visibility
+- `get_obstacle_names()` — includes SQ names
+- `has_superquadrics() → bool`
+- `get_active_types() → dict` — returns `{"superquadric": bool, ...}`
+
+#### `curobov2/curobo/curobo/_src/geom/collision/collision_scene.py`
+
+- `SceneCollisionCfg.cache` accepts `"superquadric": int` key
+- `SceneCollision.from_config()` extracts and passes `superquadric_cache`
+- `collision_types` property now includes `"superquadric": bool`
+
+---
+
+### Examples & tests
+
+| File | Description |
+|------|-------------|
+| `curobov2/curobo/curobo/examples/getting_started/superquadric_motion_planning.py` | Full Isaac Sim demo: 3 SQ obstacles, live collision query, pose update, optional GUI |
+| `curobov2/curobo/curobo/examples/getting_started/motion_planning_sq.py` | Production example: SuperDec inference → SQ/mesh scene → motion planning with timing logs |
+| `curobov2/curobo/curobo/examples/getting_started/motion_gen_sq_simple.py` | Minimal benchmark: single SQ obstacle, SQ vs mesh timing, CSV output |
+| `curobov2/curobo/curobo/examples/getting_started/compare_timings.py` | Post-hoc comparison of SQ vs mesh JSON timing logs; Matplotlib bar chart |
+| `curobov2/curobo/curobo/tests/_src/geom/test_superquadric_sdf.py` | 11 unit/integration tests covering tensor creation, SDF sign/value, gradients |
+
+Run tests:
+
+```bash
+PYTHONPATH=/home/haroldas/3DV/curobov2/curobo \
+PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH \
+~/isaacsim/python.sh \
+  curobov2/curobo/curobo/tests/_src/geom/test_superquadric_sdf.py
+```
+
+Run the demo:
+
+```bash
+PYTHONPATH=/home/haroldas/3DV/curobov2/curobo \
+PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH \
+~/isaacsim/python.sh \
+  curobov2/curobo/curobo/examples/getting_started/superquadric_motion_planning.py
+```
+
+---
+
+## CuRobo v2 — Python API
+
+### `curobo._src.geom.types.Superquadric`
+
+```python
+from curobo._src.geom.types import Superquadric
+
+sq = Superquadric(
+    name="obstacle",
+    pose=[x, y, z, qw, qx, qy, qz],   # world-frame pose
+    radii=[a1, a2, a3],                 # semi-axes in metres
+    shape=[e1, e2],                     # shape exponents (0, 2]
+)
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | `str` | — | Unique obstacle identifier |
+| `pose` | `List[float]` (7) | — | `[x, y, z, qw, qx, qy, qz]` |
+| `radii` | `List[float]` (3) | `[0.1, 0.1, 0.1]` | Semi-axes `[a₁, a₂, a₃]` |
+| `shape` | `List[float]` (2) | `[1.0, 1.0]` | Exponents `[ε₁, ε₂]` |
+| `color` | `Optional[List[float]]` | `None` | RGBA for visualisation |
+
+### Scene setup
+
+```python
+import warp as wp
+wp.init()
+
+from curobo._src.geom.types import SceneCfg, Superquadric
+from curobo._src.geom.collision.collision_scene import SceneCollision, SceneCollisionCfg
+from curobo._src.types.device_cfg import DeviceCfg
+
+device_cfg = DeviceCfg(device="cuda")
+
+scene_cfg = SceneCfg(
+    superquadric=[
+        Superquadric(name="box",  pose=[0.5,0,0.4, 1,0,0,0], radii=[0.1,0.1,0.1], shape=[0.1,0.1]),
+        Superquadric(name="ball", pose=[0.3,0,0.5, 1,0,0,0], radii=[0.08,0.08,0.08], shape=[1,1]),
+    ]
+)
+
+cfg = SceneCollisionCfg(
+    device_cfg=device_cfg,
+    scene_model=scene_cfg,
+    cache={"cuboid": 0, "superquadric": 8},   # pre-allocate for up to 8 SQs
+)
+scene = SceneCollision.from_config(cfg)
+
+print(scene.collision_types)
+# → {'cuboid': False, 'mesh': False, 'voxel': False, 'superquadric': True}
+```
+
+### Collision query
+
+```python
+import torch
+from curobo._src.geom.collision.buffer_collision import CollisionBuffer
+from curobo._src.geom.collision.checker_collision import CollisionChecker
+
+# Shape: [batch, horizon, n_spheres, 4] — (x, y, z, radius)
+query = torch.tensor([[[[0.5, 0.0, 0.4, 0.02]]]], dtype=torch.float32, device="cuda")
+
+buf      = CollisionBuffer.from_shape(query.shape[:3], device_cfg)
+weight   = device_cfg.to_device([1.0])
+act_dist = device_cfg.to_device([0.0])
+env_idx  = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+checker = CollisionChecker(device_cfg=device_cfg)
+cost = checker.get_sphere_distance(
+    scene.data, query, buf, weight, act_dist, env_query_idx=env_idx
+)
+# cost > 0 → collision; cost = 0 → free
+```
+
+### Dynamic obstacle management
+
+```python
+from curobo._src.types.pose import Pose
+
+new_pose = Pose.from_list([0.6, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0], device_cfg=device_cfg)
+scene.data.update_obstacle_pose("box", new_pose, env_idx=0)
+
+scene.data.enable_obstacle("box", enable=False, env_idx=0)   # hide
+scene.data.enable_obstacle("box", enable=True,  env_idx=0)   # show
+```
+
+### Multi-environment
+
+```python
+cfg = SceneCollisionCfg(
+    device_cfg=device_cfg,
+    scene_model=[scene_cfg_0, scene_cfg_1, scene_cfg_2],   # num_envs inferred
+    cache={"superquadric": 8},
+)
+```
+
+---
+
+## CuRobo v1 vs v2 — Comparison
+
+| Aspect | v1 (`curobo/`) | v2 (`curobov2/`) |
+|--------|----------------|------------------|
+| **Kernel language** | CUDA C++ (`.cu` files) | NVIDIA Warp (Python, JIT-compiled) |
+| **Build step** | `pip install -e curobo/ --no-build-isolation` | None — set `PYTHONPATH` only |
+| **Python bindings** | pybind11 (`geom_cu` extension module) | Warp autograd bridge |
+| **SDF algorithm** | Newton radial + Taubin (C++) | Newton radial + Taubin (Warp) — identical math |
+| **Obstacle dispatch** | Custom SQ branch in collision kernel | Plugin registry (`OBSTACLE_SDF_MODULES`) |
+| **Scene config class** | `WorldConfig(superquadric=[...])` | `SceneCfg(superquadric=[...])` |
+| **Shape exponent field** | `eps=[ε₁, ε₂]` | `shape=[ε₁, ε₂]` |
+| **Collision checker** | `WorldPrimitiveCollision` | `CollisionChecker` + `SceneCollision` |
+| **Cache config** | `cache={"obb": 0, "superquadric": N}` | `cache={"cuboid": 0, "superquadric": N}` |
+| **Gradient flow** | Manual CUDA backprop in C++ | `torch.autograd` + Warp backward |
+| **CUDA graph support** | Disabled (dynamic shapes) | Disabled (dynamic shapes) |
+| **Multi-env batching** | Custom batching in CUDA | Native PyTorch `num_envs` dimension |
