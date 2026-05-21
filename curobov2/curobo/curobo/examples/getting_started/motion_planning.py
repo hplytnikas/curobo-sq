@@ -467,6 +467,25 @@ def interactive_motion_planning(robot_file="franka.yml", scene_file="collision_t
             joint_names=traj.joint_names,
         )
 
+    def animate_gripper(from_width: float, to_width: float, steps: int = 20):
+        """Animate finger joints between two widths (0.0 = closed, 0.04 = open)."""
+        arm_pos: torch.Tensor = current_state.position.squeeze()  # type: ignore[union-attr]
+        arm_names: List[str] = current_state.joint_names or []
+        all_names = viser_viz.joint_names  # includes finger joints
+        for i in range(steps + 1):
+            width = from_width + (to_width - from_width) * i / steps
+            full_pos = torch.zeros(len(all_names), device=arm_pos.device, dtype=arm_pos.dtype)
+            for j, name in enumerate(all_names):
+                if name in arm_names:
+                    full_pos[j] = arm_pos[arm_names.index(name)]
+                elif name == "panda_finger_joint1":
+                    full_pos[j] = width
+                elif name == "panda_finger_joint2":
+                    full_pos[j] = width
+            full_state = JointState.from_position(full_pos.unsqueeze(0), joint_names=all_names)
+            viser_viz.set_joint_state(full_state.squeeze(0))  # type: ignore[arg-type]
+            time.sleep(0.02)
+
     def on_move(_):
         nonlocal is_moving
         if is_moving:
@@ -527,11 +546,13 @@ def interactive_motion_planning(robot_file="franka.yml", scene_file="collision_t
                     title="Grasp",
                 )
                 execute_trajectory(result.grasp_interpolated_trajectory)
+                animate_gripper(0.04, 0.0)  # close fingers
                 traj_plot.image = _create_trajectory_image(
                     result.lift_interpolated_trajectory, planner.joint_names,
                     title="Lift",
                 )
                 execute_trajectory(result.lift_interpolated_trajectory)
+                animate_gripper(0.0, 0.04)  # open fingers
             else:
                 print("Grasp planning failed")
             is_moving = False

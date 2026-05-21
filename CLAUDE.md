@@ -12,19 +12,18 @@ This project integrates **superquadric obstacle representations** into [CuRobo](
 
 ## Python Environment
 
-All Python commands must use the Isaac Sim interpreter with CUDA 12.8 in `PATH`:
+All Python commands use the `3dv` conda environment:
 ```bash
-PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH ~/isaacsim/python.sh <script.py>
+conda run -n 3dv python <script.py>
 ```
 
-There is also an `omni_python` alias that wraps this. The virtual env at `.venv/` is separate and used for SuperDec training/inference.
+The virtual env at `.venv/` is separate and used for SuperDec training/inference.
 
 ## Building CuRobo CUDA Extensions
 
 After modifying any `.cu` or `.cpp` file in `curobo/src/curobolib/cpp/`:
 ```bash
-PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH ~/isaacsim/python.sh \
-  -m pip install -e curobo/ --no-build-isolation
+conda run -n 3dv python -m pip install -e curobo/ --no-build-isolation
 ```
 GPU architecture target: **8.9** (RTX 4090 / Ada). NVCC flags include `-O3 --ftz=true --fmad=true`.
 
@@ -32,10 +31,10 @@ GPU architecture target: **8.9** (RTX 4090 / Ada). NVCC flags include `-O3 --ftz
 
 ```bash
 # Superquadric rotation/quaternion regression test (most relevant)
-PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH ~/isaacsim/python.sh tests/test_sq_rotation.py
+conda run -n 3dv python tests/test_sq_rotation.py
 
 # Main integration demo
-PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH ~/isaacsim/python.sh \
+conda run -n 3dv python \
   curobo/examples/isaac_sim/motion_gen_reacher_superquadrics.py \
   --world_representation superquadrics
 ```

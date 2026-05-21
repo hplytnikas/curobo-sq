@@ -71,7 +71,7 @@ robot_cfg:
     tool_frames:
     - panda_hand
     extra_collision_spheres:
-      attached_object: 4
+      attached_object: 8
     extra_links:
       attached_object:
         fixed_transform:

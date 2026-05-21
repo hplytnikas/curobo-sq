@@ -50,6 +50,7 @@ if str(SUPERDEC_ROOT) not in sys.path:
     sys.path.append(str(SUPERDEC_ROOT))
 
 from superdec.superdec import SuperDec
+from superdec.utils.predictions_handler import PredictionHandler
 
 LOG_DIR = Path("/home/haroldas/3DV/logs/curobov2/timing")
 
@@ -61,11 +62,23 @@ TABLE = Cuboid(
 
 DEFAULT_SCENE_TRANSLATION = np.array([-0.29955, -0.68389, 0.13559], dtype=np.float32)
 DEFAULT_SCENE_QUAT_WXYZ = np.array([0.70711, 0.70711, 0.0, 0.0], dtype=np.float32)
+DEFAULT_PLY_ROTATE_DEG_X = 90.0
+DEFAULT_PLY_TRANSLATION = np.array([0.3, 0.8, -0.2], dtype=np.float32)
+DEFAULT_SUPERDEC_SAMPLE_POINTS = 8192
+DEFAULT_SQ_DISPLAY_MESH_RESOLUTION = 1000
+
+SCALING_TEST_SIZES = [0, 2, 5, 20, 50]
+DEFAULT_SCALING_TARGETS = [
+    [0.7, 0.17, 0.5],
+    [-0.1, -0.368, 0.5],
+    [0.4, 0.4, 0.6],
+    [0.5, -0.3, 0.4],
+]
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ply_path", type=str, required=True, help="Input point cloud (.ply) for SuperDec")
+    parser.add_argument("--ply_path", type=str, default="/home/haroldas/3DV/superdec/examples/chair.ply", help="Input point cloud (.ply) for SuperDec")
     parser.add_argument(
         "--checkpoint_folder",
         type=str,
@@ -79,7 +92,13 @@ def _parse_args() -> argparse.Namespace:
         default="superquadrics",
         help="Which scene representation to plan against",
     )
-    parser.add_argument("--mesh_resolution", type=int, default=28, help="SuperDec mesh resolution")
+    parser.add_argument("--mesh_resolution", type=int, default=48, help="SuperDec mesh resolution")
+    parser.add_argument(
+        "--sq_display_mesh_resolution",
+        type=int,
+        default=DEFAULT_SQ_DISPLAY_MESH_RESOLUTION,
+        help="Display-only SQ mesh resolution in superquadrics mode",
+    )
     parser.add_argument("--scale_factor", type=float, default=1.0, help="Uniform scale applied to the SuperDec object")
     parser.add_argument(
         "--scene_translation",
@@ -118,8 +137,17 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         metavar="N",
         help=(
-            "Add N sofa obstacles (seat + backrest cuboid pairs) arranged in a grid "
-            "around the robot arm, ~1 m apart, all on the ground plane."
+            "Add N additional instances of the input pointcloud arranged in a grid "
+            "around the robot arm, ~1.5 m apart, each processed through SuperDec."
+        ),
+    )
+    parser.add_argument(
+        "--scaling_test",
+        action="store_true",
+        help=(
+            f"Run a scaling benchmark: iterate through {SCALING_TEST_SIZES} additional sofa "
+            "instances, plan to target poses at each size, and plot planning time vs obstacle count. "
+            "Uses --auto_cube_targets if provided, otherwise falls back to DEFAULT_SCALING_TARGETS."
         ),
     )
     return parser.parse_args()
@@ -150,49 +178,96 @@ def _sofa_grid_positions(n: int, spacing: float = 1.5, min_dist: float = 1.1) ->
     return [(p[0], p[1]) for p in candidates[:n]]
 
 
-def _make_sofa_obstacles(n_sofas: int, spacing: float = 1.5) -> List[Cuboid]:
-    """Return 2*n_sofas Cuboids (seat + backrest) arranged around the robot.
+def _make_pointcloud_instances(
+    n: int,
+    outdict: dict,
+    points_tensor: torch.Tensor,
+    world_representation: str,
+    mesh_resolution: int,
+    scale_factor: float,
+    base_scene_translation: np.ndarray,
+    base_scene_quat_wxyz: np.ndarray,
+    native_meshes: List[trimesh.Trimesh] | None = None,
+    spacing: float = 1.5,
+) -> Tuple[List[Superquadric], List[Mesh]]:
+    """Return SQ/mesh primitives for N copies of the SuperDec prediction placed around the robot.
 
-    Each sofa faces toward the robot: the open seat side is toward the origin
-    and the backrest is on the far side.  The long axis (0.9 m width) is
-    tangential to the circle, keeping roughly 1 m clear between adjacent sofas.
-
-    Dimensions (local frame, x = depth toward robot, y = width, z = height):
-      seat      0.45 × 0.90 × 0.18 m
-      backrest  0.12 × 0.90 × 0.50 m
+    Each instance is placed at a grid position from _sofa_grid_positions and rotated
+    around Z so it faces toward the robot, composing with base_scene_quat_wxyz.
     """
-    if n_sofas <= 0:
-        return []
+    if n <= 0:
+        return [], []
 
-    positions = _sofa_grid_positions(n_sofas, spacing=spacing)
-    cuboids: List[Cuboid] = []
+    positions = _sofa_grid_positions(n, spacing=spacing)
+    base_rot_xyzw = np.array([
+        base_scene_quat_wxyz[1], base_scene_quat_wxyz[2],
+        base_scene_quat_wxyz[3], base_scene_quat_wxyz[0],
+    ], dtype=np.float32)
+    base_rot = SciRotation.from_quat(base_rot_xyzw)
 
-    for i, (cx, cy) in enumerate(positions):
+    primitive_count = int(outdict["scale"].shape[1])
+    if world_representation == "mesh" and native_meshes is None:
+        native_meshes = _superdec_native_meshes(outdict, points_tensor, mesh_resolution)
+
+    all_sqs: List[Superquadric] = []
+    all_meshes: List[Mesh] = []
+
+    for inst_idx, (cx, cy) in enumerate(positions):
         dist = math.sqrt(cx ** 2 + cy ** 2)
-        # θ = angle from origin to sofa → local-x axis points away from robot
         theta = math.atan2(cy, cx) if dist > 1e-6 else 0.0
-        qw = math.cos(theta / 2)
-        qz = math.sin(theta / 2)
-        quat = [qw, 0.0, 0.0, qz]
 
-        # Seat — bottom flush with ground (z = 0)
-        cuboids.append(Cuboid(
-            name=f"sofa_{i}_seat",
-            pose=[cx, cy, 0.09, *quat],
-            dims=[0.45, 0.9, 0.18],
-        ))
+        # Rz(theta) rotates the chair to face the robot; compose with the base orientation
+        inst_rot = SciRotation.from_euler("z", theta) * base_rot
+        inst_quat_xyzw = inst_rot.as_quat()
+        inst_quat_wxyz = np.array([
+            inst_quat_xyzw[3], inst_quat_xyzw[0], inst_quat_xyzw[1], inst_quat_xyzw[2],
+        ], dtype=np.float32)
+        inst_translation = np.array([cx, cy, float(base_scene_translation[2])], dtype=np.float32)
 
-        # Backrest — back face aligned with seat back face (local-x = +0.225),
-        # backrest center at local-x = 0.225 − 0.06 = 0.165 from seat centre.
-        bx = cx + math.cos(theta) * 0.165
-        by = cy + math.sin(theta) * 0.165
-        cuboids.append(Cuboid(
-            name=f"sofa_{i}_back",
-            pose=[bx, by, 0.25, *quat],
-            dims=[0.12, 0.9, 0.5],
-        ))
+        if world_representation == "mesh" and native_meshes is not None:
+            inst_rot = SciRotation.from_euler("z", theta) * base_rot
+            inst_rot_matrix = inst_rot.as_matrix()
+            for mesh_idx, mesh_tm in enumerate(native_meshes):
+                transformed_mesh = _transform_trimesh_mesh(
+                    mesh_tm,
+                    inst_rot_matrix,
+                    inst_translation,
+                    scale_factor=scale_factor,
+                )
+                all_meshes.append(Mesh(
+                    name=f"inst_{inst_idx}_mesh_{mesh_idx}",
+                    vertices=transformed_mesh.vertices.tolist(),
+                    faces=transformed_mesh.faces.tolist(),
+                    pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                ))
+            continue
 
-    return cuboids
+        for idx in range(primitive_count):
+            if float(outdict["exist"][0, idx]) <= 0.5:
+                continue
+
+            scale = np.asarray(outdict["scale"][0, idx], dtype=np.float32) * scale_factor
+            exponents = np.asarray(outdict["shape"][0, idx], dtype=np.float32)
+            rotation = np.asarray(outdict["rotate"][0, idx], dtype=np.float32)
+            translation = np.asarray(outdict["trans"][0, idx], dtype=np.float32)
+
+            t_trans, t_rot = _apply_scene_transform(
+                translation.tolist(), rotation, inst_translation, inst_quat_wxyz
+            )
+            pose = [
+                float(t_trans[0]), float(t_trans[1]), float(t_trans[2]),
+                *_rotation_matrix_to_wxyz(t_rot),
+            ]
+            
+            if world_representation == "superquadrics":
+                all_sqs.append(Superquadric(
+                    name=f"inst_{inst_idx}_sq_{idx}",
+                    pose=pose,
+                    radii=scale.tolist(),
+                    shape=exponents.tolist(),
+                ))
+
+    return all_sqs, all_meshes
 
 
 def _normalize_points(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
@@ -222,11 +297,15 @@ def _load_superdec_outputs(
     checkpoint_folder: str,
 ) -> tuple[dict, torch.Tensor]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
     checkpoint = torch.load(os.path.join(checkpoint_folder, "ckpt.pt"), map_location=device, weights_only=False)
     configs = OmegaConf.load(os.path.join(checkpoint_folder, "config.yaml"))
+    print("Loading SuperDec model from checkpoint ...")
     model = SuperDec(configs.superdec).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
+
+    print("Loaded SuperDec model from checkpoint.")
 
     pc = trimesh.load(ply_path, process=False)
     if isinstance(pc, trimesh.Scene):
@@ -247,12 +326,18 @@ def _load_superdec_outputs(
     if points_np.size == 0:
         raise ValueError(f"No points found in point cloud: {ply_path}")
 
-    sample_size = min(4096, len(points_np))
+    # Align imported point clouds to the expected frame before SuperDec inference.
+    rot_x = SciRotation.from_euler("x", DEFAULT_PLY_ROTATE_DEG_X, degrees=True)
+    points_np = rot_x.apply(points_np)
+    points_np = points_np + DEFAULT_PLY_TRANSLATION
+
+    sample_size = min(DEFAULT_SUPERDEC_SAMPLE_POINTS, len(points_np))
     sample_idx = np.random.choice(len(points_np), sample_size, replace=len(points_np) < sample_size)
     points = points_np[sample_idx]
     points, translation, scale = _normalize_points(points)
     points_tensor = torch.from_numpy(points).unsqueeze(0).to(device).float()
 
+    print("Running SuperDec inference ...")
     with torch.no_grad():
         outdict = model(points_tensor)
         for key, value in outdict.items():
@@ -262,6 +347,7 @@ def _load_superdec_outputs(
         points_tensor = _denormalize_points(
             points_tensor.cpu(), np.asarray(translation, dtype=np.float32), scale, False
         )
+    print("SuperDec inference complete.")
 
     return outdict, points_tensor
 
@@ -335,8 +421,68 @@ def _primitive_mesh(
     return trimesh.Trimesh(vertices=np.array(vertices), faces=np.array(triangles))
 
 
+def _transform_trimesh_mesh(
+    mesh_tm: trimesh.Trimesh,
+    rotation_matrix: np.ndarray,
+    translation: Sequence[float],
+    scale_factor: float = 1.0,
+) -> trimesh.Trimesh:
+    vertices = np.asarray(mesh_tm.vertices, dtype=np.float32) * float(scale_factor)
+    vertices = (rotation_matrix @ vertices.T).T + np.asarray(translation, dtype=np.float32)
+    return trimesh.Trimesh(vertices=vertices, faces=np.asarray(mesh_tm.faces), process=False)
+
+
+def _superdec_native_meshes(outdict: dict, points_tensor: torch.Tensor, resolution: int) -> List[trimesh.Trimesh]:
+    """Build the native SuperDec meshes for a single inferred object."""
+    pred_handler = PredictionHandler.from_outdict(outdict, points_tensor, ["object"])
+    combined_mesh = pred_handler.get_meshes(resolution=resolution, colors=False)[0]
+    if combined_mesh is None:
+        return []
+
+    individual_meshes = combined_mesh.split()
+    if len(individual_meshes) == 0:
+        individual_meshes = [combined_mesh]
+
+    return [trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, process=False) for mesh in individual_meshes]
+
+
+def _superdec_display_scene_cfg(
+    outdict: dict,
+    points_tensor: torch.Tensor,
+    resolution: int,
+    scene_translation: Sequence[float],
+    scene_quat_wxyz: Sequence[float],
+) -> SceneCfg:
+    """Build high-resolution display meshes from SuperDec predictions.
+
+    This is visualization-only and does not affect collision checking.
+    """
+    native_meshes = _superdec_native_meshes(outdict, points_tensor, resolution)
+    if len(native_meshes) == 0:
+        return SceneCfg(mesh=[])
+
+    scene_quat_xyzw = np.array(
+        [scene_quat_wxyz[1], scene_quat_wxyz[2], scene_quat_wxyz[3], scene_quat_wxyz[0]], dtype=np.float32
+    )
+    scene_rot = SciRotation.from_quat(scene_quat_xyzw)
+
+    meshes: List[Mesh] = []
+    for i, mesh_tm in enumerate(native_meshes):
+        transformed = _transform_trimesh_mesh(mesh_tm, scene_rot.as_matrix(), scene_translation)
+        meshes.append(
+            Mesh(
+                name=f"sq_display_{i}",
+                vertices=transformed.vertices.tolist(),
+                faces=transformed.faces.tolist(),
+                pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            )
+        )
+    return SceneCfg(mesh=meshes)
+
+
 def _prediction_to_scene_cfg(
     outdict: dict,
+    points_tensor: torch.Tensor,
     world_representation: str,
     mesh_resolution: int,
     scale_factor: float,
@@ -345,6 +491,10 @@ def _prediction_to_scene_cfg(
 ) -> SceneCfg:
     scene_translation_np = np.asarray(scene_translation, dtype=np.float32)
     scene_quat_np = np.asarray(scene_quat_wxyz, dtype=np.float32)
+    scene_quat_xyzw = np.array(
+        [scene_quat_np[1], scene_quat_np[2], scene_quat_np[3], scene_quat_np[0]], dtype=np.float32
+    )
+    scene_rot = SciRotation.from_quat(scene_quat_xyzw)
 
     superquadrics: List[Superquadric] = []
     meshes: List[Mesh] = []
@@ -369,30 +519,33 @@ def _prediction_to_scene_cfg(
             *_rotation_matrix_to_wxyz(transformed_rotation),
         ]
 
-        superquadrics.append(
-            Superquadric(
-                name=f"chair_sq_{idx}",
-                pose=pose,
-                radii=scale.tolist(),
-                shape=exponents.tolist(),
+        if world_representation == "superquadrics":
+            superquadrics.append(
+                Superquadric(
+                    name=f"chair_sq_{idx}",
+                    pose=pose,
+                    radii=scale.tolist(),
+                    shape=exponents.tolist(),
+                )
             )
-        )
 
-        mesh_tm = _primitive_mesh(
-            scale.tolist(),
-            exponents.tolist(),
-            transformed_rotation,
-            transformed_translation.tolist(),
-            mesh_resolution,
-        )
-        meshes.append(
-            Mesh(
-                name=f"chair_mesh_{idx}",
-                vertices=mesh_tm.vertices.tolist(),
-                faces=mesh_tm.faces.tolist(),
-                pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+    if world_representation == "mesh":
+        native_meshes = _superdec_native_meshes(outdict, points_tensor, mesh_resolution)
+        for idx, mesh_tm in enumerate(native_meshes):
+            transformed_mesh = _transform_trimesh_mesh(
+                mesh_tm,
+                scene_rot.as_matrix(),
+                scene_translation_np,
+                scale_factor=scale_factor,
             )
-        )
+            meshes.append(
+                Mesh(
+                    name=f"chair_mesh_{idx}",
+                    vertices=transformed_mesh.vertices.tolist(),
+                    faces=transformed_mesh.faces.tolist(),
+                    pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                )
+            )
 
     if world_representation == "superquadrics":
         scene = SceneCfg(cuboid=[TABLE], superquadric=superquadrics)
@@ -401,10 +554,8 @@ def _prediction_to_scene_cfg(
     else:
         raise ValueError(f"Unsupported world_representation: {world_representation}")
 
-    print(
-        f"Built SuperDec scene with {len(superquadrics)} superquadrics and {len(meshes)} mesh primitives "
-        f"(mode={world_representation})"
-    )
+    n_prims = len(superquadrics) if world_representation == "superquadrics" else len(meshes)
+    print(f"Built SuperDec scene with {n_prims} {world_representation} primitives")
     return scene
 
 
@@ -538,7 +689,122 @@ def run_auto_targets(
     return records
 
 
-def interactive_motion_planning(planner: MotionPlanner, scene_cfg: SceneCfg, use_cuda_graph: bool = True, port: int = 8080) -> None:
+def run_auto_targets_visualized(
+    planner: MotionPlanner,
+    scene_cfg: SceneCfg,
+    targets: List[List[float]],
+    display_scene_cfg: SceneCfg | None = None,
+    port: int = 8080,
+) -> Tuple[List[dict], float]:
+    """Plan to each target, animate the robot in Viser, then keep the viewer open.
+
+    Sequencing per target i:
+      1. Target frame jumps to position i          (visible immediately)
+      2. Wait 2 s so the user can see it
+      3. Target frame jumps to position i+1        (robot is about to chase i)
+      4. Robot plans + animates to position i      (frame already shows next target)
+    """
+    viser_viz = ViserVisualizer(
+        content_path=ContentPath(robot_config_file="franka.yml"),
+        connect_ip="0.0.0.0",
+        connect_port=port,
+        add_control_frames=True,
+        visualize_robot_spheres=False,
+    )
+    viser_viz.add_scene(display_scene_cfg if display_scene_cfg is not None else scene_cfg, add_control_frames=True)
+
+    print(f"\nOpen http://localhost:{port} to watch the robot.")
+    print("Waiting 3 s for browser to connect before starting...")
+    time.sleep(3.0)
+
+    current_state = JointState.from_position(
+        torch.as_tensor(
+            planner.default_joint_state.position,
+            device=planner.device_cfg.device,
+            dtype=torch.float32,
+        ).unsqueeze(0),
+        joint_names=planner.joint_names,
+    )
+
+    is_moving = False
+
+    def execute_trajectory(trajectory) -> None:
+        nonlocal current_state, is_moving
+        traj = trajectory.squeeze(0)
+        for i in range(traj.position.shape[-2]):
+            if not is_moving:
+                return
+            waypoint = JointState.from_position(
+                traj.position[0, i, :].unsqueeze(0),
+                joint_names=traj.joint_names,
+            )
+            viser_viz.set_joint_state(waypoint.squeeze(0))
+            time.sleep(0.02)
+        current_state = JointState.from_position(
+            traj.position[0, -1, :].unsqueeze(0),
+            joint_names=traj.joint_names,
+        )
+    
+    viz_pause_total_s = 3.0  # initial browser connection wait
+
+    records = []
+    for i, xyz in enumerate(targets):
+        print(f"  [{i+1}/{len(targets)}] Planning to target {xyz} ...", end=" ", flush=True)
+        viser_viz._control_frames["panda_hand"].position = (xyz[0], xyz[1], xyz[2])
+
+        def plan_and_execute(_i=i, _xyz=xyz) -> None:
+            nonlocal is_moving
+            is_moving = True
+            target_poses = viser_viz.get_control_frame_pose()
+
+            active_js = planner.kinematics.get_active_js(current_state.clone())
+            t0 = time.perf_counter()
+            result = planner.plan_pose(
+                GoalToolPose.from_poses(target_poses, num_goalset=1),
+                active_js,
+                use_implicit_goal=True,
+                max_attempts=3,
+            )
+            elapsed = time.perf_counter() - t0
+
+            success = bool(result is not None and result.success.any())
+            status_str = "OK" if success else "FAIL"
+            print(f"{elapsed:.4f}s  [{status_str}]")
+
+            records.append({
+                "target_index": _i,
+                "target_xyz": _xyz,
+                "plan_s": elapsed,
+                "success": success,
+            })
+
+            if result is not None and result.success.any():
+                execute_trajectory(result.get_interpolated_plan())
+            else:
+                print("Motion planning failed")
+            is_moving = False
+
+        t = threading.Thread(target=plan_and_execute, daemon=True)
+        t.start()
+        t.join()
+
+    print("\nAll targets done. Viewer stays open — press Ctrl+C to exit.")
+    try:
+        while True:
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+
+    return records, viz_pause_total_s
+
+
+def interactive_motion_planning(
+    planner: MotionPlanner,
+    scene_cfg: SceneCfg,
+    use_cuda_graph: bool = True,
+    port: int = 8080,
+    display_scene_cfg: SceneCfg | None = None,
+) -> None:
     """Launch the same Viser-based interaction model as the standard tutorial."""
     viser_viz = ViserVisualizer(
         content_path=ContentPath(robot_config_file="franka.yml"),
@@ -549,6 +815,9 @@ def interactive_motion_planning(planner: MotionPlanner, scene_cfg: SceneCfg, use
     )
 
     obstacle_frames = viser_viz.add_scene(scene_cfg, add_control_frames=True)
+    # Add optional high-resolution display meshes as a visual overlay.
+    if display_scene_cfg is not None and display_scene_cfg.mesh is not None:
+        _add_scene_handles(viser_viz, display_scene_cfg)
     old_obstacle_poses = {
         name: Pose.from_numpy(frame.position, frame.wxyz) for name, frame in obstacle_frames.items()
     }
@@ -592,7 +861,9 @@ def interactive_motion_planning(planner: MotionPlanner, scene_cfg: SceneCfg, use
             nonlocal is_moving
             is_moving = True
             update_obstacles()
+
             target_poses = viser_viz.get_control_frame_pose()
+
             active_js = planner.kinematics.get_active_js(current_state.clone())
             result = planner.plan_pose(
                 GoalToolPose.from_poses(target_poses, num_goalset=1),
@@ -691,9 +962,292 @@ def interactive_motion_planning(planner: MotionPlanner, scene_cfg: SceneCfg, use
         print("\nShutting down...")
 
 
+def _add_scene_handles(viser_viz, scene_cfg: SceneCfg) -> list:
+    """Add scene to Viser as meshes and return handles so they can be removed later."""
+    mesh_scene = SceneCfg.create_mesh_scene(scene_cfg)
+    handles = []
+    for mesh in (mesh_scene.mesh or []):
+        h = viser_viz.add_mesh(
+            mesh.get_trimesh_mesh(transform_with_pose=True),
+            name="/obstacles/" + mesh.name + "/mesh",
+        )
+        handles.append(h)
+    return handles
+
+
+def _run_size_visualized(
+    viser_viz,
+    planner: MotionPlanner,
+    targets: List[List[float]],
+) -> List[dict]:
+    """Plan and animate through all targets in an existing Viser viewer.
+
+    Mirrors run_auto_targets_visualized but returns immediately after the last
+    target instead of blocking — the caller decides whether to keep the viewer open.
+    """
+    current_state = JointState.from_position(
+        torch.as_tensor(
+            planner.default_joint_state.position,
+            device=planner.device_cfg.device,
+            dtype=torch.float32,
+        ).unsqueeze(0),
+        joint_names=planner.joint_names,
+    )
+    is_moving = False
+    records: List[dict] = []
+
+    def execute_trajectory(trajectory) -> None:
+        nonlocal current_state, is_moving
+        traj = trajectory.squeeze(0)
+        for step in range(traj.position.shape[-2]):
+            if not is_moving:
+                return
+            waypoint = JointState.from_position(
+                traj.position[0, step, :].unsqueeze(0),
+                joint_names=traj.joint_names,
+            )
+            viser_viz.set_joint_state(waypoint.squeeze(0))
+            time.sleep(0.02)
+        current_state = JointState.from_position(
+            traj.position[0, -1, :].unsqueeze(0),
+            joint_names=traj.joint_names,
+        )
+
+    for i, xyz in enumerate(targets):
+        print(f"  [{i+1}/{len(targets)}] Planning to {xyz} ...", end=" ", flush=True)
+        viser_viz._control_frames["panda_hand"].position = (xyz[0], xyz[1], xyz[2])
+
+        def plan_and_execute(_i=i, _xyz=xyz) -> None:
+            nonlocal is_moving
+            is_moving = True
+            target_poses = viser_viz.get_control_frame_pose()
+            active_js = planner.kinematics.get_active_js(current_state.clone())
+            t0 = time.perf_counter()
+            result = planner.plan_pose(
+                GoalToolPose.from_poses(target_poses, num_goalset=1),
+                active_js,
+                use_implicit_goal=True,
+                max_attempts=3,
+            )
+            elapsed = time.perf_counter() - t0
+            success = bool(result is not None and result.success.any())
+            print(f"{elapsed:.4f}s  [{'OK' if success else 'FAIL'}]")
+            records.append({"target_index": _i, "target_xyz": _xyz, "plan_s": elapsed, "success": success})
+            if result is not None and success:
+                execute_trajectory(result.get_interpolated_plan())
+            else:
+                print("Motion planning failed")
+            is_moving = False
+
+        t = threading.Thread(target=plan_and_execute, daemon=True)
+        t.start()
+        t.join()
+
+    return records
+
+
+def _plot_scaling_results(results: List[dict], representation: str) -> Path:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    xs = [r["n_collision_objects"] for r in results]
+    means = [r["mean_plan_s"] for r in results]
+    mins = [r["min_plan_s"] for r in results]
+    maxs = [r["max_plan_s"] for r in results]
+    err_low = [m - mn for m, mn in zip(means, mins)]
+    err_high = [mx - m for mx, m in zip(maxs, means)]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.errorbar(
+        xs, means,
+        yerr=[err_low, err_high],
+        marker="o", capsize=5, linewidth=2, markersize=8,
+        label=representation,
+    )
+    for r in results:
+        ax.annotate(
+            f"n={r['n_sofas']}\n{r['n_success']}/{r['n_total']}",
+            (r["n_collision_objects"], r["mean_plan_s"]),
+            textcoords="offset points", xytext=(6, 4), fontsize=8,
+        )
+    ax.set_xlabel("Collision objects in scene")
+    ax.set_ylabel("Mean planning time (s)")
+    ax.set_title(f"Planning time vs scene complexity — {representation}")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    plot_path = LOG_DIR / f"scaling_{representation}_{timestamp}.png"
+    plt.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    print(f"Scaling plot saved → {plot_path}")
+    return plot_path
+
+
+def run_scaling_test(
+    args: argparse.Namespace,
+    outdict: dict,
+    points_tensor: torch.Tensor,
+    targets: List[List[float]],
+    sizes: List[int] = SCALING_TEST_SIZES,
+    visualize: bool = False,
+    port: int = 8080,
+) -> List[dict]:
+    """Plan to targets at each scene size in *sizes* and plot the results.
+
+    When *visualize* is True a single Viser viewer is kept open for the entire
+    test; the scene is swapped between sizes so the browser never needs to reload.
+    After the last size the viewer stays open until Ctrl-C.
+    """
+    device_cfg = DeviceCfg(device=args.device)
+    results = []
+
+    # ---- One-time Viser setup ------------------------------------------------
+    viser_viz = None
+    scene_handles: list = []
+    if visualize:
+        viser_viz = ViserVisualizer(
+            content_path=ContentPath(robot_config_file="franka.yml"),
+            connect_ip="0.0.0.0",
+            connect_port=port,
+            add_control_frames=True,
+            visualize_robot_spheres=False,
+        )
+        print(f"\nOpen http://localhost:{port} to watch the scaling test.")
+        print("Waiting 3 s for browser to connect before starting...")
+        time.sleep(3.0)
+
+    for n_sofas in sizes:
+        print(f"\n{'='*55}")
+        print(f"Scaling test  |  representation={args.world_representation}  |  n_sofas={n_sofas}")
+        print(f"{'='*55}")
+
+        scene_cfg = _prediction_to_scene_cfg(
+            outdict=outdict,
+            points_tensor=points_tensor,
+            world_representation=args.world_representation,
+            mesh_resolution=args.mesh_resolution,
+            scale_factor=args.scale_factor,
+            scene_translation=args.scene_translation,
+            scene_quat_wxyz=args.scene_quat_wxyz,
+        )
+
+        if n_sofas > 0:
+            inst_sqs, inst_meshes = _make_pointcloud_instances(
+                n_sofas,
+                outdict,
+                points_tensor,
+                args.world_representation,
+                args.mesh_resolution,
+                args.scale_factor,
+                np.asarray(args.scene_translation, dtype=np.float32),
+                np.asarray(args.scene_quat_wxyz, dtype=np.float32),
+            )
+            scene_cfg = SceneCfg(
+                cuboid=scene_cfg.cuboid,
+                superquadric=list(scene_cfg.superquadric or []) + inst_sqs,
+                mesh=list(scene_cfg.mesh or []) + inst_meshes,
+            )
+
+        n_sq = _count_items(scene_cfg.superquadric)
+        n_mesh = _count_items(scene_cfg.mesh)
+        n_cub = _count_items(scene_cfg.cuboid)
+        n_total_obs = n_sq + n_mesh + n_cub
+        print(f"Scene: {n_sq} SQs  {n_mesh} meshes  {n_cub} cuboids  = {n_total_obs} total")
+
+        # ---- Swap scene in viewer --------------------------------------------
+        if viser_viz is not None:
+            display_scene_cfg = scene_cfg
+            if args.world_representation == "superquadrics":
+                display_scene_cfg = _superdec_display_scene_cfg(
+                    outdict=outdict,
+                    points_tensor=points_tensor,
+                    resolution=args.sq_display_mesh_resolution,
+                    scene_translation=args.scene_translation,
+                    scene_quat_wxyz=args.scene_quat_wxyz,
+                )
+            for h in scene_handles:
+                try:
+                    h.remove()
+                except Exception:
+                    pass
+            scene_handles = _add_scene_handles(viser_viz, display_scene_cfg)
+
+        planner_cfg = MotionPlannerCfg.create(
+            robot="franka.yml",
+            scene_model="collision_test.yml",
+            device_cfg=device_cfg,
+            use_cuda_graph=False,
+            max_goalset=10,
+        )
+        planner_cfg.scene_collision_cfg = SceneCollisionCfg(
+            device_cfg=device_cfg,
+            scene_model=scene_cfg,
+            cache={"cuboid": n_cub, "mesh": n_mesh, "superquadric": n_sq},
+        )
+        planner = MotionPlanner(planner_cfg)
+        planner.warmup(enable_graph=False, num_warmup_iterations=5)
+
+        if viser_viz is not None:
+            plan_records = _run_size_visualized(viser_viz, planner, targets)
+        else:
+            plan_records = run_auto_targets(planner, targets)
+
+        plan_times = [r["plan_s"] for r in plan_records]
+        n_ok = sum(r["success"] for r in plan_records)
+
+        results.append({
+            "n_sofas": n_sofas,
+            "n_collision_objects": n_total_obs,
+            "n_sq": n_sq,
+            "n_mesh": n_mesh,
+            "mean_plan_s": float(np.mean(plan_times)) if plan_times else 0.0,
+            "min_plan_s": float(np.min(plan_times)) if plan_times else 0.0,
+            "max_plan_s": float(np.max(plan_times)) if plan_times else 0.0,
+            "n_success": n_ok,
+            "n_total": len(plan_records),
+        })
+        print(
+            f"  mean={results[-1]['mean_plan_s']:.4f}s  "
+            f"min={results[-1]['min_plan_s']:.4f}s  "
+            f"max={results[-1]['max_plan_s']:.4f}s  "
+            f"success={n_ok}/{len(plan_records)}"
+        )
+
+    _plot_scaling_results(results, args.world_representation)
+
+    if not args.no_log_timing:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        log_path = LOG_DIR / f"scaling_{args.world_representation}_{timestamp}.json"
+        with open(log_path, "w") as fh:
+            json.dump({
+                "representation": args.world_representation,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "sizes": sizes,
+                "results": results,
+            }, fh, indent=2)
+        print(f"Scaling log saved → {log_path}")
+
+    if viser_viz is not None:
+        print("\nAll sizes done. Final scene stays visible — press Ctrl+C to exit.")
+        try:
+            while True:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+
+    return results
+
+
 def main() -> None:
+    print("Starting SQ motion planning example")
     args = _parse_args()
     wp.init()
+
 
     t_total_start = time.perf_counter()
     timing: dict = {
@@ -705,13 +1259,27 @@ def main() -> None:
     device_cfg = DeviceCfg(device=args.device)
 
     t0 = time.perf_counter()
-    outdict, _ = _load_superdec_outputs(args.ply_path, args.checkpoint_folder)
+    outdict, points_tensor = _load_superdec_outputs(args.ply_path, args.checkpoint_folder)
     timing["superdec_inference_s"] = time.perf_counter() - t0
     print(f"SuperDec inference: {timing['superdec_inference_s']:.3f}s")
+
+    # ---- Scaling test (iterates over SCALING_TEST_SIZES, then exits) --------
+    if args.scaling_test:
+        if args.auto_cube_targets is not None:
+            try:
+                scaling_targets = json.loads(args.auto_cube_targets)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"--auto_cube_targets must be valid JSON: {exc}") from exc
+        else:
+            scaling_targets = DEFAULT_SCALING_TARGETS
+            print(f"--scaling_test: no --auto_cube_targets supplied, using {len(scaling_targets)} default targets")
+        run_scaling_test(args, outdict, points_tensor, scaling_targets, visualize=args.visualize)
+        return
 
     t0 = time.perf_counter()
     scene_cfg = _prediction_to_scene_cfg(
         outdict=outdict,
+        points_tensor=points_tensor,
         world_representation=args.world_representation,
         mesh_resolution=args.mesh_resolution,
         scale_factor=args.scale_factor,
@@ -722,13 +1290,22 @@ def main() -> None:
     print(f"Scene build: {timing['scene_build_s']:.3f}s")
 
     if args.sofas > 0:
-        sofa_cuboids = _make_sofa_obstacles(args.sofas)
-        scene_cfg = SceneCfg(
-            cuboid=list(scene_cfg.cuboid or []) + sofa_cuboids,
-            superquadric=scene_cfg.superquadric,
-            mesh=scene_cfg.mesh,
+        inst_sqs, inst_meshes = _make_pointcloud_instances(
+            args.sofas,
+            outdict,
+            points_tensor,
+            args.world_representation,
+            args.mesh_resolution,
+            args.scale_factor,
+            np.asarray(args.scene_translation, dtype=np.float32),
+            np.asarray(args.scene_quat_wxyz, dtype=np.float32),
         )
-        print(f"Added {args.sofas} sofas ({len(sofa_cuboids)} cuboids) to the scene")
+        scene_cfg = SceneCfg(
+            cuboid=scene_cfg.cuboid,
+            superquadric=list(scene_cfg.superquadric or []) + inst_sqs,
+            mesh=list(scene_cfg.mesh or []) + inst_meshes,
+        )
+        print(f"Added {args.sofas} pointcloud instances ({len(inst_sqs)} SQs, {len(inst_meshes)} meshes) to the scene")
 
     timing["n_superquadrics"] = _count_items(scene_cfg.superquadric)
     timing["n_meshes"] = _count_items(scene_cfg.mesh)
@@ -741,7 +1318,8 @@ def main() -> None:
         f"(incl. {args.sofas} sofas)"
     )
 
-    use_cuda_graph = args.world_representation != "superquadrics"
+    # use_cuda_graph = args.world_representation != "superquadrics"
+    use_cuda_graph = False
 
     t0 = time.perf_counter()
     planner_cfg = MotionPlannerCfg.create(
@@ -764,16 +1342,22 @@ def main() -> None:
     timing["planner_init_s"] = time.perf_counter() - t0
     print(f"Planner init: {timing['planner_init_s']:.3f}s")
 
-    if args.visualize:
-        interactive_motion_planning(planner, scene_cfg, use_cuda_graph=use_cuda_graph)
-        return
-
     t0 = time.perf_counter()
     planner.warmup(enable_graph=use_cuda_graph, num_warmup_iterations=5)
     timing["warmup_s"] = time.perf_counter() - t0
     print(f"Warmup: {timing['warmup_s']:.3f}s")
 
     # ---- Auto-target sequencing -----------------------------------------
+    display_scene_cfg: SceneCfg | None = None
+    if args.visualize and args.world_representation == "superquadrics":
+        display_scene_cfg = _superdec_display_scene_cfg(
+            outdict=outdict,
+            points_tensor=points_tensor,
+            resolution=args.sq_display_mesh_resolution,
+            scene_translation=args.scene_translation,
+            scene_quat_wxyz=args.scene_quat_wxyz,
+        )
+
     if args.auto_cube_targets is not None:
         try:
             targets = json.loads(args.auto_cube_targets)
@@ -782,10 +1366,20 @@ def main() -> None:
         if not isinstance(targets, list) or not all(len(t) == 3 for t in targets):
             raise ValueError("--auto_cube_targets must be a list of [x, y, z] triples")
 
-        print(f"\nAuto-target planning: {len(targets)} targets")
-        plan_records = run_auto_targets(planner, targets)
-        timing["plans"] = plan_records
+        if args.visualize:
+            # Animate the robot through each target in the Viser viewer (blocks until Ctrl+C).
+            plan_records, viz_pause_total_s = run_auto_targets_visualized(
+                planner,
+                scene_cfg,
+                targets,
+                display_scene_cfg=display_scene_cfg,
+            )
+            timing["viz_pause_total_s"] = viz_pause_total_s
+        else:
+            print(f"\nAuto-target planning: {len(targets)} targets")
+            plan_records = run_auto_targets(planner, targets)
 
+        timing["plans"] = plan_records
         plan_times = [r["plan_s"] for r in plan_records]
         timing["plan_mean_s"] = float(np.mean(plan_times)) if plan_times else None
         timing["plan_min_s"] = float(np.min(plan_times)) if plan_times else None
@@ -798,8 +1392,8 @@ def main() -> None:
             f"min={timing['plan_min_s']:.4f}s  "
             f"max={timing['plan_max_s']:.4f}s"
         )
-    else:
-        # Fall back to the fixed examples when no targets given
+    elif not args.visualize:
+        # Fall back to the fixed examples only when no targets and no visualizer
         t0 = time.perf_counter()
         pose_planning_example(planner)
         timing["pose_plan_s"] = time.perf_counter() - t0
@@ -816,6 +1410,15 @@ def main() -> None:
 
     if not args.no_log_timing:
         _save_timing_log(timing)
+
+    # --visualize alone (no --auto_cube_targets) → interactive mode.
+    if args.visualize and args.auto_cube_targets is None:
+        interactive_motion_planning(
+            planner,
+            scene_cfg,
+            use_cuda_graph=use_cuda_graph,
+            display_scene_cfg=display_scene_cfg,
+        )
 
 
 if __name__ == "__main__":

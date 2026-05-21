@@ -139,6 +139,10 @@ class TrajOptSolver:
         return self.core.scene_collision_checker
 
     @property
+    def attachment_manager(self):
+        return self.core.attachment_manager
+
+    @property
     def goal_registry_manager(self):
         return self.core.goal_registry_manager
 

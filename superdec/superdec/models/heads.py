@@ -5,12 +5,13 @@ import torch
 class SuperDecHead(nn.Module):
     """Head for Superquadrics Prediction"""
     
-    def __init__(self, emb_dims):
+    def __init__(self, emb_dims, rotation6d: bool = False):
         super(SuperDecHead, self).__init__()
         self.emb_dims = emb_dims
+        self.rotation6d = rotation6d
         self.scale_head = nn.Linear(emb_dims, 3)
         self.shape_head = nn.Linear(emb_dims, 2)
-        self.rot_head = nn.Linear(emb_dims, 4)
+        self.rot_head = nn.Linear(emb_dims, 6 if rotation6d else 4)
         self.t_head = nn.Linear(emb_dims, 3)
         self.exist_head = nn.Linear(emb_dims, 1)
 
@@ -22,8 +23,12 @@ class SuperDecHead(nn.Module):
         shape_before_activation = self.shape_head(x)
         shape = self.shape_activation(shape_before_activation)
 
-        q = F.normalize(self.rot_head(x), dim=-1, p=2)
-        rotation = self.quat2mat(q)
+        rot_params = self.rot_head(x)
+        if self.rotation6d:
+            rotation = self.rot6d_to_mat(rot_params)
+        else:
+            q = F.normalize(rot_params, dim=-1, p=2)
+            rotation = self.quat2mat(q)
 
         translation = self.t_head(x)
 
@@ -47,6 +52,19 @@ class SuperDecHead(nn.Module):
                             2*xz - 2*wy, 2*wx + 2*yz, w2 - x2 - y2 + z2], dim=1).view(B, N, 3, 3)
         rotMat = rotMat.view(B,N,3,3)
         return rotMat 
+
+    @staticmethod
+    def rot6d_to_mat(rot6d: torch.Tensor) -> torch.Tensor:
+        """Convert 6D rotation representation to a 3x3 rotation matrix."""
+        a1 = rot6d[..., 0:3]
+        a2 = rot6d[..., 3:6]
+
+        b1 = F.normalize(a1, dim=-1, p=2)
+        proj = (b1 * a2).sum(dim=-1, keepdim=True)
+        b2 = F.normalize(a2 - proj * b1, dim=-1, p=2)
+        b3 = torch.cross(b1, b2, dim=-1)
+
+        return torch.stack((b1, b2, b3), dim=-1)
     
     def scale_activation(self, x):
         return  torch.sigmoid(x) 
