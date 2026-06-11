@@ -255,11 +255,18 @@ class MotionPlanner:
             solve_time += ik_result.solve_time
 
             success_count = torch.count_nonzero(ik_result.success)
-            if success_count == 0:
-                continue
 
             seed_config = ik_result.solution
-            if success_count < num_seeds:
+            if seed_config is None:
+                continue
+
+            if success_count == 0:
+                # Keep the best IK seed even if the feasibility gate rejected it.
+                # The downstream trajopt stage can still rescue near-solutions in
+                # tighter mesh scenes where IK's rollout-based feasibility check
+                # is overly conservative.
+                pass
+            elif success_count < num_seeds:
                 good_solution = seed_config[ik_result.success][0:1, :].clone()
                 seed_config[~ik_result.success][:, :] = good_solution
 
@@ -270,12 +277,11 @@ class MotionPlanner:
                 graph_seed = self._get_graph_seed_trajectories(
                     current_state, seed_config,
                 )
-                if graph_seed is None:
-                    continue
-                seed_traj = graph_seed
-                total_time += 0.0  # graph time already in graph_seed call
-                finetune_attempts = 3
-                finetune_dt_scale = 0.75
+                if graph_seed is not None:
+                    seed_traj = graph_seed
+                    total_time += 0.0  # graph time already in graph_seed call
+                    finetune_attempts = 3
+                    finetune_dt_scale = 0.75
 
             trajopt_result = self.trajopt_solver.solve_pose(
                 goal_tool_poses, current_state,
@@ -359,9 +365,8 @@ class MotionPlanner:
                 graph_seed = self._get_graph_seed_trajectories(
                     current_state, goal_configs,
                 )
-                if graph_seed is None:
-                    continue
-                seed_traj = graph_seed
+                if graph_seed is not None:
+                    seed_traj = graph_seed
 
             trajopt_result = self.trajopt_solver.solve_cspace(
                 goal_state, current_state, seed_traj=seed_traj,

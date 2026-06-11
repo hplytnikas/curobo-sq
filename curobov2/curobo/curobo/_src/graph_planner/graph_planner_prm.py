@@ -335,10 +335,19 @@ class PRMGraphPlanner:
         # check if start and goal are in freespace:
         mask = self.check_samples_feasibility(node_set)
         if mask.all() != True:
-            log_warn("Start or End state in collision")
+            mask_pairs = mask.view(num_problems, 2)
+            start_ok = mask_pairs[:, 0]
+            goal_ok = mask_pairs[:, 1]
+            collision_info = []
+            for i in range(num_problems):
+                if not start_ok[i]:
+                    collision_info.append(f"problem {i}: start in collision")
+                if not goal_ok[i]:
+                    collision_info.append(f"problem {i}: goal in collision")
+            log_warn("Start or End state in collision: " + "; ".join(collision_info))
             result.plan_waypoints = [None for _ in range(num_problems)]
             result.valid_query = False
-            result.debug_info = "Start or End state in collision"
+            result.debug_info = "Start or End state in collision: " + "; ".join(collision_info)
             return result
 
         # if start and goal are same, return True:

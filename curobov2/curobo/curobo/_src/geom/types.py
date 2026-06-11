@@ -817,7 +817,7 @@ class Superquadric(Obstacle):
                 b = a + 1
                 c = a + n
                 d = c + 1
-                faces.extend([[a, b, d], [a, d, c]])
+                faces.extend([[a, d, b], [a, c, d]])
 
         m = trimesh.Trimesh(vertices=verts, faces=faces)
         if self.color is not None:
