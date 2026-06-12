@@ -694,51 +694,69 @@ def _superdec_display_scene_cfg(
     scene_translation: Sequence[float],
     scene_quat_wxyz: Sequence[float],
     scale_factor: float,
-) -> SceneCfg:
-    """Build a display-only SceneCfg with pre-transformed vertices and identity pose."""
+) -> Tuple[SceneCfg, Dict[int, np.ndarray]]:
+    """Build a display-only SceneCfg.
+
+    Each mesh is expressed in centroid-relative local coordinates with the centroid
+    stored as the mesh pose. This places the Viser control-frame gizmo on the object
+    and lets point-cloud / overlay-mesh children inherit the gizmo transform.
+
+    Returns (SceneCfg, centroids) where centroids maps pred.iid → centroid xyz.
+    """
     scene_q_xyzw = np.array(
         [scene_quat_wxyz[1], scene_quat_wxyz[2], scene_quat_wxyz[3], scene_quat_wxyz[0]],
         dtype=np.float32,
     )
     rot = SciRotation.from_quat(scene_q_xyzw).as_matrix()
     display_meshes = []
+    centroids: Dict[int, np.ndarray] = {}
     for pred in predictions:
         if pred.mesh is None:
             continue
         tm = _transform_trimesh_mesh(pred.mesh, rot, scene_translation, scale_factor)
+        verts = np.array(tm.vertices, dtype=np.float32)
+        centroid = verts.mean(axis=0)
+        centroids[pred.iid] = centroid
         display_meshes.append(Mesh(
             name=f"obj_{pred.iid}",
-            vertices=tm.vertices.tolist(),
+            vertices=(verts - centroid).tolist(),
             faces=tm.faces.tolist(),
-            pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            pose=[float(centroid[0]), float(centroid[1]), float(centroid[2]), 1.0, 0.0, 0.0, 0.0],
         ))
-    return SceneCfg(cuboid=list(cuboids) if cuboids else [], mesh=display_meshes)
+    return SceneCfg(cuboid=list(cuboids) if cuboids else [], mesh=display_meshes), centroids
 
 
 # ── Viser overlays ────────────────────────────────────────────────────────────
 
 def _add_superdec_overlays(
     viser_viz,
-    xyz: np.ndarray,
-    rgb: np.ndarray,
+    object_pts: List[np.ndarray],
+    object_colors: List[np.ndarray],
     predictions: List[SuperDecPrediction],
     scene_translation: Sequence[float],
     scene_quat_wxyz: Sequence[float],
     scale_factor: float,
+    centroids: Dict[int, np.ndarray],
     add_meshes: bool = True,
 ) -> list:
-    """Add raw point cloud and fitted meshes to the Viser scene; returns handles."""
+    """Add point cloud and fitted meshes to the Viser scene; returns handles.
+
+    Point cloud: one combined cloud at /scene (single draw call, no per-object overhead).
+    Overlay meshes: added as children of /obstacles/obj_{iid}/ so they follow the gizmo.
+    """
     server = viser_viz._server
     handles = []
 
-    pc_handle = server.scene.add_point_cloud(
-        name="/scene",
-        points=_transform_pointcloud(xyz, scene_translation, scene_quat_wxyz),
-        colors=rgb,
-        point_size=0.003,
-        visible=True,
-    )
-    handles.append(pc_handle)
+    all_pts = [_transform_pointcloud(pts, scene_translation, scene_quat_wxyz) for pts in object_pts]
+    all_colors_clipped = [c[: len(p)] for p, c in zip(all_pts, object_colors)]
+    if all_pts:
+        handles.append(server.scene.add_point_cloud(
+            name="/scene",
+            points=np.concatenate(all_pts).astype(np.float32),
+            colors=np.concatenate(all_colors_clipped).astype(np.float32),
+            point_size=0.003,
+            visible=True,
+        ))
 
     if not add_meshes:
         return handles
@@ -751,10 +769,14 @@ def _add_superdec_overlays(
     for pred in predictions:
         if pred.mesh is None:
             continue
+        centroid = centroids.get(pred.iid, np.zeros(3, dtype=np.float32))
         tm = _transform_trimesh_mesh(pred.mesh, rot, scene_translation, scale_factor)
-        handles.append(
-            server.scene.add_mesh_trimesh(f"/fit/obj_{pred.iid}", mesh=tm, visible=True)
-        )
+        verts_local = np.array(tm.vertices, dtype=np.float32) - centroid
+        handles.append(server.scene.add_mesh_trimesh(
+            f"/obstacles/obj_{pred.iid}/fit",
+            mesh=trimesh.Trimesh(vertices=verts_local, faces=np.asarray(tm.faces), process=False),
+            visible=True,
+        ))
     return handles
 
 
@@ -916,16 +938,18 @@ def interactive_motion_planning(
     }
 
     # ── initial obstacle display ───────────────────────────────────────────────
-    _disp_cfg = _superdec_display_scene_cfg(
+    _disp_cfg, cur_centroids = _superdec_display_scene_cfg(
         cur_spec.predictions or [], [TABLE], SCENE_TRANSLATION, SCENE_QUAT_WXYZ, 1.0
     )
     obstacle_frames: dict = viser_viz.add_scene(_disp_cfg, add_control_frames=True)
 
     overlay_handles: list = []
-    if cur_spec.xyz is not None and cur_spec.rgb is not None:
+    if cur_spec.object_pts:
         overlay_handles = _add_superdec_overlays(
-            viser_viz, cur_spec.xyz, cur_spec.rgb, cur_spec.predictions or [],
+            viser_viz, cur_spec.object_pts, cur_spec.object_colors,
+            cur_spec.predictions or [],
             SCENE_TRANSLATION, SCENE_QUAT_WXYZ, 1.0,
+            centroids=cur_centroids,
             add_meshes=(cur_rep != "mesh"),
         )
 
@@ -956,19 +980,20 @@ def interactive_motion_planning(
 
     # ── internal helpers ───────────────────────────────────────────────────────
 
-    def _rebuild_obstacle_display(spec: SceneSpec, add_cf: bool) -> None:
+    def _rebuild_obstacle_display(spec: SceneSpec, add_cf: bool) -> Dict[int, np.ndarray]:
         nonlocal obstacle_frames, tracked_frames, old_obstacle_poses
         try:
             server.scene.remove_by_name("/obstacles")
         except Exception:
             pass
-        disp = _superdec_display_scene_cfg(
+        disp, new_centroids = _superdec_display_scene_cfg(
             spec.predictions or [], [TABLE], SCENE_TRANSLATION, SCENE_QUAT_WXYZ, 1.0
         )
         obstacle_frames = viser_viz.add_scene(disp, add_control_frames=add_cf)
         col_ns = set(planner.scene_collision_checker.get_obstacle_names())
         tracked_frames = {n: f for n, f in obstacle_frames.items() if n in col_ns}
         old_obstacle_poses = {n: Pose.from_numpy(f.position, f.wxyz) for n, f in tracked_frames.items()}
+        return new_centroids
 
     def _clear_overlays() -> None:
         for h in overlay_handles:
@@ -977,11 +1002,10 @@ def interactive_motion_planning(
             except Exception:
                 pass
         overlay_handles.clear()
-        for path in ("/scene", "/fit"):
-            try:
-                server.scene.remove_by_name(path)
-            except Exception:
-                pass
+        try:
+            server.scene.remove_by_name("/scene")
+        except Exception:
+            pass
 
     def update_obstacles() -> None:
         if not objects_movable:
@@ -1014,9 +1038,18 @@ def interactive_motion_planning(
 
     @movable_chk.on_update
     def _(_event) -> None:
-        nonlocal objects_movable
+        nonlocal objects_movable, cur_centroids
         objects_movable = movable_chk.value
-        _rebuild_obstacle_display(cur_spec, objects_movable)
+        _clear_overlays()
+        cur_centroids = _rebuild_obstacle_display(cur_spec, objects_movable)
+        if pc_chk.value and cur_spec.object_pts:
+            overlay_handles.extend(_add_superdec_overlays(
+                viser_viz, cur_spec.object_pts, cur_spec.object_colors,
+                cur_spec.predictions or [],
+                SCENE_TRANSLATION, SCENE_QUAT_WXYZ, 1.0,
+                centroids=cur_centroids,
+                add_meshes=(cur_rep != "mesh"),
+            ))
 
     @pc_chk.on_update
     def _(_event) -> None:
@@ -1059,7 +1092,7 @@ def interactive_motion_planning(
         threading.Thread(target=_switch_representation, args=(repr_dd.value,), daemon=True).start()
 
     def _switch_scene(new_name: str) -> None:
-        nonlocal planner, is_moving, cur_spec, tracked_frames, old_obstacle_poses
+        nonlocal planner, is_moving, cur_spec, tracked_frames, old_obstacle_poses, cur_centroids
         is_moving = True
         status_md.content = f"**Status:** Loading {new_name}…"
         try:
@@ -1073,12 +1106,14 @@ def interactive_motion_planning(
             )
             planner = _rebuild_planner(new_cfg, cur_rep, device_cfg)
             cur_spec = spec
-            _rebuild_obstacle_display(spec, objects_movable)
             _clear_overlays()
-            if pc_chk.value and spec.xyz is not None and spec.rgb is not None:
+            cur_centroids = _rebuild_obstacle_display(spec, objects_movable)
+            if pc_chk.value and spec.object_pts:
                 overlay_handles.extend(_add_superdec_overlays(
-                    viser_viz, spec.xyz, spec.rgb, spec.predictions or [],
+                    viser_viz, spec.object_pts, spec.object_colors,
+                    spec.predictions or [],
                     SCENE_TRANSLATION, SCENE_QUAT_WXYZ, 1.0,
+                    centroids=cur_centroids,
                     add_meshes=(cur_rep != "mesh"),
                 ))
             status_md.content = "**Status:** Ready"
