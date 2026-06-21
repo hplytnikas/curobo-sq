@@ -54,9 +54,11 @@ from scipy.spatial import cKDTree
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import motion_planning_sq_demo as demo  # noqa: E402
 
-from curobo._src.geom.types import Cuboid  # noqa: E402
+from curobo._src.geom.types import Cuboid, Mesh, SceneCfg  # noqa: E402
 from curobo._src.types.device_cfg import DeviceCfg  # noqa: E402
 from curobo.types import GoalToolPose, JointState, Pose  # noqa: E402
+
+from superdec.utils.predictions_handler import PredictionHandler  # noqa: E402
 
 
 # ── configuration ───────────────────────────────────────────────────────────────
@@ -71,7 +73,32 @@ N_TARGETS = 4                       # targets per scene (sequential tour waypoin
 BASE_SEED = 1000                    # per-scene seed = BASE_SEED + index
 PLAYBACK_HZ = 50.0                  # wall-clock playback rate (matches demo: 0.02 s/step)
 
-REPRESENTATIONS = ["superquadrics", "mesh"]
+# Representations to benchmark:
+#   superquadrics  - analytic SQ SDF kernel, one primitive per superquadric
+#   mesh           - SQ surfaces tessellated to triangles, ONE MESH PER SUPERQUADRIC
+#                    (same primitive granularity as the SQ mode -> fair per-primitive plot)
+#   pointcloud     - the REAL object point cloud turned into a watertight voxel-surface
+#                    mesh via curobo's native Mesh.from_pointcloud (one mesh per object);
+#                    faithful "ground-truth shape" baseline.
+#   shapenet_mesh  - the ORIGINAL ShapeNet object mesh (one per object); only runs if
+#                    build found mesh files (the ONet data ships only point clouds, so
+#                    this is normally skipped).
+REPRESENTATIONS = ["superquadrics", "mesh", "pointcloud"]
+
+# For planner construction, the mesh/pointcloud/shapenet_mesh modes all use the mesh backend.
+_PLANNER_REP = {
+    "superquadrics": "superquadrics", "mesh": "mesh",
+    "pointcloud": "mesh", "shapenet_mesh": "mesh",
+}
+
+# Voxel pitch (m) for Mesh.from_pointcloud in the 'pointcloud' representation.
+# Smaller = more faithful to the real surface but more triangles.
+PC_PITCH = 0.01
+
+# Candidate file names for an original ShapeNet mesh inside a model directory,
+# tried in order.  Extended with a generic glob for *.obj / *.off / *.ply.
+ORIG_MESH_NAMES = ["model_normalized.obj", "model.obj", "mesh.obj", "mesh.off",
+                   "mesh.ply", "model.off", "model.ply"]
 
 # Collision skin: a robot sphere counts as a true collision with the object
 # point cloud when the nearest point is closer than (radius - skin).  Keep at 0
@@ -111,10 +138,77 @@ def _make_table(table_half: float) -> Cuboid:
 class _CachedPred:
     """A SuperDec prediction at the origin, reusable across placements."""
     outdict: dict
-    mesh_v: np.ndarray
-    mesh_f: np.ndarray
+    sq_meshes: List[Tuple[np.ndarray, np.ndarray]]   # one (verts, faces) per superquadric
+    orig_mesh: Optional[Tuple[np.ndarray, np.ndarray]]  # original ShapeNet mesh, or None
     pts: np.ndarray       # origin-centred object points [N, 3]
     colors: np.ndarray    # [N, 3]
+
+
+def _per_sq_meshes(outdict: dict, resolution: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Tessellate each existing superquadric of an object into its own mesh."""
+    handler = PredictionHandler.from_outdict(outdict, torch.zeros(1, 1, 3), ["0"])
+    meshes: List[Tuple[np.ndarray, np.ndarray]] = []
+    P = handler.scale.shape[1]
+    for p in range(P):
+        if handler.exist[0, p] > 0.5:
+            v, f = handler._superquadric_mesh(
+                handler.scale[0, p], handler.exponents[0, p],
+                handler.rotation[0, p], handler.translation[0, p], resolution,
+            )
+            meshes.append((np.asarray(v, dtype=np.float32), np.asarray(f, dtype=np.int64)))
+    return meshes
+
+
+def _find_orig_mesh_path(dataset, idx: int) -> Optional[str]:
+    """Locate an original mesh file in the model directory, if the dataset exposes paths."""
+    items = getattr(dataset, "_items", None)
+    if items is None:
+        return None
+    model_dir = os.path.dirname(items[idx])
+    for name in ORIG_MESH_NAMES:
+        p = os.path.join(model_dir, name)
+        if os.path.isfile(p):
+            return p
+    # generic fallback: first mesh-like file in the directory
+    for ext in (".obj", ".off", ".ply", ".glb"):
+        for f in sorted(os.listdir(model_dir)):
+            if f.lower().endswith(ext):
+                return os.path.join(model_dir, f)
+    return None
+
+
+def _load_orig_mesh(
+    dataset, idx: int, object_size_m: float, pts0: np.ndarray,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Load the original ShapeNet mesh and align it to the object's point cloud.
+
+    The mesh is oriented y-up -> z-up (matching ``_shapenet_item_to_zup``) and then
+    bbox-aligned (per-axis scale + translate) to ``pts0`` so it coincides with the
+    point cloud / SQ fit regardless of how the source mesh was normalised.
+    Returns origin-frame (verts, faces) or None if no mesh file is found.
+    """
+    path = _find_orig_mesh_path(dataset, idx)
+    if path is None:
+        return None
+    try:
+        m = trimesh.load(path, process=False, force="mesh")
+        if isinstance(m, trimesh.Scene):
+            m = m.dump(concatenate=True)
+        v = np.asarray(m.vertices, dtype=np.float32)
+        f = np.asarray(m.faces, dtype=np.int64)
+        if len(v) == 0 or len(f) == 0:
+            return None
+        # y-up -> z-up (same rotation as the point cloud)
+        v = demo.rotate_around_axis(v, axis=(1, 0, 0), angle=np.pi / 2, center_point=np.zeros(3))
+        # per-axis bbox alignment to the (already scaled/rotated/floored) point cloud
+        pmin, pmax = pts0.min(0), pts0.max(0)
+        vmin, vmax = v.min(0), v.max(0)
+        scale = (pmax - pmin) / np.maximum(vmax - vmin, 1e-6)
+        v = (v - vmin) * scale + pmin
+        return v.astype(np.float32), f
+    except Exception as exc:
+        print(f"  [orig-mesh] failed to load {path}: {exc}")
+        return None
 
 
 def _infer_origin_object(
@@ -128,8 +222,8 @@ def _infer_origin_object(
         return None
     return _CachedPred(
         outdict=pred.outdict,
-        mesh_v=np.asarray(pred.mesh.vertices, dtype=np.float32),
-        mesh_f=np.asarray(pred.mesh.faces, dtype=np.int64),
+        sq_meshes=_per_sq_meshes(pred.outdict, mesh_resolution),
+        orig_mesh=_load_orig_mesh(dataset, idx, object_size_m, pts.astype(np.float32)),
         pts=pts.astype(np.float32),
         colors=colors.astype(np.float32),
     )
@@ -146,11 +240,14 @@ def _place_cached(cached: _CachedPred, center: np.ndarray, iid: int) -> dict:
     trans[..., 0] += center[0]
     trans[..., 1] += center[1]
     outdict["trans"] = trans
+    orig = None
+    if cached.orig_mesh is not None:
+        orig = (cached.orig_mesh[0] + offset, cached.orig_mesh[1])
     return {
         "iid": iid,
         "outdict": outdict,
-        "mesh_v": cached.mesh_v + offset,
-        "mesh_f": cached.mesh_f,
+        "sq_meshes": [(v + offset, f) for (v, f) in cached.sq_meshes],
+        "orig_mesh": orig,
         "pts": cached.pts + offset,
         "colors": cached.colors,
     }
@@ -198,27 +295,44 @@ def build_benchmark_scene(
                 raise RuntimeError(f"scene n={n}: could not find a valid object after 200 tries")
 
         placed = _place_cached(cached, center, iid=slot)
-        predictions.append({k: placed[k] for k in ("iid", "outdict", "mesh_v", "mesh_f")})
+        predictions.append({k: placed[k] for k in ("iid", "outdict", "sq_meshes", "orig_mesh")})
         object_pts.append(placed["pts"])
         object_colors.append(placed["colors"])
 
     n_cached = sum(1 for v in pred_cache.values() if v is not None)
+    has_orig_mesh = bool(predictions) and all(p["orig_mesh"] is not None for p in predictions)
     print(f"  scene n={n}: {len(predictions)} objects placed "
-          f"({n_cached} unique models inferred, {len(pred_cache) - n_cached} rejected)")
+          f"({n_cached} unique models inferred, {len(pred_cache) - n_cached} rejected); "
+          f"original meshes available: {has_orig_mesh}")
     return {
         "name": f"scene_{n:03d}",
         "n_objects": n,
         "object_pts": object_pts,
         "object_colors": object_colors,
         "predictions": predictions,
+        "has_orig_mesh": has_orig_mesh,
     }
 
 
+def _fuse_meshes(meshes: List[Tuple[np.ndarray, np.ndarray]]) -> trimesh.Trimesh:
+    """Concatenate per-superquadric meshes into one trimesh (for display only)."""
+    verts, faces, offset = [], [], 0
+    for v, f in meshes:
+        verts.append(v)
+        faces.append(f + offset)
+        offset += len(v)
+    if not verts:
+        return trimesh.Trimesh()
+    return trimesh.Trimesh(
+        vertices=np.concatenate(verts), faces=np.concatenate(faces), process=False
+    )
+
+
 def _scene_predictions(scene: dict) -> List[demo.SuperDecPrediction]:
-    """Reconstruct demo.SuperDecPrediction objects from a cached scene dict."""
+    """Reconstruct demo.SuperDecPrediction objects (fused mesh) for display."""
     preds = []
     for p in scene["predictions"]:
-        mesh = trimesh.Trimesh(vertices=p["mesh_v"], faces=p["mesh_f"], process=False)
+        mesh = _fuse_meshes(p["sq_meshes"])
         preds.append(demo.SuperDecPrediction(iid=p["iid"], outdict=p["outdict"], mesh=mesh))
     return preds
 
@@ -495,23 +609,64 @@ def _interp_positions_per_step(interp: JointState) -> torch.Tensor:
     return pos
 
 
+def _build_scene_cfg(scene: dict, representation: str) -> Tuple[SceneCfg, int]:
+    """Build the collision SceneCfg for one representation; return (cfg, n_primitives).
+
+    superquadrics  one Superquadric per primitive (via demo._prediction_to_scene_cfg)
+    mesh           one Mesh per superquadric (NOT fused per object)
+    shapenet_mesh  one Mesh per object, from the original ShapeNet mesh
+    """
+    table = _make_table(scene_geometry(scene["n_objects"])[2])
+    demo.TABLE = table  # demo._prediction_to_scene_cfg reads this global
+
+    if representation == "superquadrics":
+        cfg = demo._prediction_to_scene_cfg(
+            _scene_predictions(scene), "superquadrics", 1.0,
+            demo.SCENE_TRANSLATION, demo.SCENE_QUAT_WXYZ, torch.zeros(1),
+        )
+        return cfg, demo._count_items(cfg.superquadric)
+
+    meshes: List[Mesh] = []
+    if representation == "mesh":
+        for p in scene["predictions"]:
+            for k, (v, f) in enumerate(p["sq_meshes"]):
+                meshes.append(Mesh(
+                    name=f"obj_{p['iid']}_sq_{k}",
+                    vertices=v.tolist(), faces=f.tolist(),
+                    pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                ))
+    elif representation == "pointcloud":
+        # Native curobo: voxel-surface mesh of the real per-object point cloud.
+        for p, pts in zip(scene["predictions"], scene["object_pts"]):
+            meshes.append(Mesh.from_pointcloud(
+                np.asarray(pts, dtype=np.float64), pitch=PC_PITCH,
+                name=f"obj_{p['iid']}_pc",
+            ))
+    elif representation == "shapenet_mesh":
+        for p in scene["predictions"]:
+            if p["orig_mesh"] is None:
+                continue
+            v, f = p["orig_mesh"]
+            meshes.append(Mesh(
+                name=f"obj_{p['iid']}",
+                vertices=v.tolist(), faces=f.tolist(),
+                pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            ))
+    else:
+        raise ValueError(f"Unknown representation: {representation!r}")
+
+    cfg = SceneCfg(cuboid=[table], mesh=meshes)
+    print(f"Built scene: {len(meshes)} {representation} mesh primitive(s)")
+    return cfg, len(meshes)
+
+
 def benchmark_one(
     scene: dict, representation: str, targets: List[List[float]],
     device_cfg: DeviceCfg, tree: cKDTree, visualize, args,
 ) -> List[dict]:
     """Run the sequential tour for one (scene, representation). Returns per-leg rows."""
-    preds = _scene_predictions(scene)
-    # Use the per-scene table so the planner's world matches the built scene.
-    demo.TABLE = _make_table(scene_geometry(scene["n_objects"])[2])
-    scene_cfg = demo._prediction_to_scene_cfg(
-        preds, representation, 1.0,
-        demo.SCENE_TRANSLATION, demo.SCENE_QUAT_WXYZ, torch.zeros(1),
-    )
-    n_primitives = (
-        demo._count_items(scene_cfg.superquadric)
-        if representation == "superquadrics" else demo._count_items(scene_cfg.mesh)
-    )
-    planner = demo._rebuild_planner(scene_cfg, representation, device_cfg)
+    scene_cfg, n_primitives = _build_scene_cfg(scene, representation)
+    planner = demo._rebuild_planner(scene_cfg, _PLANNER_REP[representation], device_cfg)
     tool_frame = planner.kinematics.tool_frames[0]
 
     current_state = planner.default_joint_state.clone().unsqueeze(0)
@@ -650,6 +805,9 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
         print(f"\n=== {scene['name']} ({scene['n_objects']} objects, "
               f"{len(all_pts)} points) ===")
         for rep in REPRESENTATIONS:
+            if rep == "shapenet_mesh" and not scene.get("has_orig_mesh", False):
+                print(f"[skip] {scene['name']} shapenet_mesh: no original meshes in dataset")
+                continue
             rows = benchmark_one(scene, rep, scene_targets, device_cfg, tree, visualize, args)
             all_rows.extend(rows)
 

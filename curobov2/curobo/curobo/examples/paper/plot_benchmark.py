@@ -28,26 +28,33 @@ OUT_DIR = Path(__file__).resolve().parent / "eval_out"
 RESULTS_CSV = OUT_DIR / "results.csv"
 
 REP_STYLE = {
-    "superquadrics": dict(color="tab:blue", marker="o", label="superquadrics"),
-    "mesh": dict(color="tab:red", marker="s", label="mesh"),
+    "superquadrics": dict(color="tab:blue", marker="o", label="superquadrics (SDF)"),
+    "mesh": dict(color="tab:red", marker="s", label="mesh (SQ tessellation)"),
+    "pointcloud": dict(color="tab:green", marker="^", label="point cloud (voxel-surface mesh)"),
+    "shapenet_mesh": dict(color="tab:purple", marker="D", label="mesh (original ShapeNet)"),
 }
+
+# Plot against number of collision primitives (per-SQ for sq/mesh, per-object for
+# shapenet_mesh) rather than number of objects.
+X_COL = "n_primitives"
+X_LABEL = "number of collision primitives in scene"
 
 
 def _agg(df: pd.DataFrame, value: str) -> pd.DataFrame:
-    """Mean + std of ``value`` per (n_objects, representation), successful legs only."""
+    """Mean + std of ``value`` per (X_COL, representation), successful legs only."""
     ok = df[df["plan_success"] == 1]
-    g = ok.groupby(["representation", "n_objects"])[value]
+    g = ok.groupby(["representation", X_COL])[value]
     return g.agg(["mean", "std", "count"]).reset_index()
 
 
 def _line(ax, df, value, rep, **extra):
     sub = _agg(df, value)
-    sub = sub[sub["representation"] == rep].sort_values("n_objects")
+    sub = sub[sub["representation"] == rep].sort_values(X_COL)
     if sub.empty:
         return
     style = dict(REP_STYLE[rep])
     style.update(extra)
-    ax.errorbar(sub["n_objects"], sub["mean"], yerr=sub["std"].fillna(0.0),
+    ax.errorbar(sub[X_COL], sub["mean"], yerr=sub["std"].fillna(0.0),
                 capsize=3, **style)
 
 
@@ -57,7 +64,7 @@ def plot_planning_time(df: pd.DataFrame, log_x: bool) -> None:
         _line(ax, df, "plan_wall_s", rep)
         _line(ax, df, "plan_solver_total_s", rep,
               linestyle="--", marker="x", label=f"{rep} (solver)")
-    ax.set_xlabel("number of objects in scene")
+    ax.set_xlabel(X_LABEL)
     ax.set_ylabel("planning time per leg [s]")
     ax.set_title("Planning time: superquadrics vs. mesh")
     if log_x:
@@ -76,7 +83,7 @@ def plot_motion_time(df: pd.DataFrame, log_x: bool) -> None:
         _line(ax, df, "motion_time_s", rep)
         _line(ax, df, "playback_s", rep,
               linestyle="--", marker="x", label=f"{rep} (playback)")
-    ax.set_xlabel("number of objects in scene")
+    ax.set_xlabel(X_LABEL)
     ax.set_ylabel("trajectory time per leg [s]")
     ax.set_title("Motion time (time-optimal) & playback: superquadrics vs. mesh")
     if log_x:
@@ -94,10 +101,10 @@ def plot_collision(df: pd.DataFrame, log_x: bool) -> None:
     for rep in REP_STYLE:
         _line(ax1, df, "frac_in_collision", rep)
         _line(ax2, df, "max_penetration_m", rep)
-    ax1.set_xlabel("number of objects in scene")
+    ax1.set_xlabel(X_LABEL)
     ax1.set_ylabel("fraction of trajectory in true collision")
     ax1.set_title("Ground-truth collision rate")
-    ax2.set_xlabel("number of objects in scene")
+    ax2.set_xlabel(X_LABEL)
     ax2.set_ylabel("max penetration into point cloud [m]")
     ax2.set_title("Ground-truth penetration depth")
     for ax in (ax1, ax2):
