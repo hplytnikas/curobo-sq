@@ -936,12 +936,16 @@ def interactive_motion_planning(
         name: (tuple(f.position), tuple(f.wxyz))
         for name, f in viser_viz._control_frames.items()
     }
+    _initial_obstacle_poses: dict = {}  # name → (pos, wxyz) at scene-load time
 
     # ── initial obstacle display ───────────────────────────────────────────────
     _disp_cfg, cur_centroids = _superdec_display_scene_cfg(
         cur_spec.predictions or [], [TABLE], SCENE_TRANSLATION, SCENE_QUAT_WXYZ, 1.0
     )
     obstacle_frames: dict = viser_viz.add_scene(_disp_cfg, add_control_frames=True)
+    _initial_obstacle_poses.update(
+        {n: (tuple(f.position), tuple(f.wxyz)) for n, f in obstacle_frames.items()}
+    )
 
     overlay_handles: list = []
     if cur_spec.object_pts:
@@ -1042,6 +1046,10 @@ def interactive_motion_planning(
         objects_movable = movable_chk.value
         _clear_overlays()
         cur_centroids = _rebuild_obstacle_display(cur_spec, objects_movable)
+        _initial_obstacle_poses.clear()
+        _initial_obstacle_poses.update(
+            {n: (tuple(f.position), tuple(f.wxyz)) for n, f in obstacle_frames.items()}
+        )
         if pc_chk.value and cur_spec.object_pts:
             overlay_handles.extend(_add_superdec_overlays(
                 viser_viz, cur_spec.object_pts, cur_spec.object_colors,
@@ -1108,6 +1116,10 @@ def interactive_motion_planning(
             cur_spec = spec
             _clear_overlays()
             cur_centroids = _rebuild_obstacle_display(spec, objects_movable)
+            _initial_obstacle_poses.clear()
+            _initial_obstacle_poses.update(
+                {n: (tuple(f.position), tuple(f.wxyz)) for n, f in obstacle_frames.items()}
+            )
             if pc_chk.value and spec.object_pts:
                 overlay_handles.extend(_add_superdec_overlays(
                     viser_viz, spec.object_pts, spec.object_colors,
@@ -1232,6 +1244,14 @@ def interactive_motion_planning(
             if name in viser_viz._control_frames:
                 viser_viz._control_frames[name].position = pos
                 viser_viz._control_frames[name].wxyz = wxyz
+        for name, (pos, wxyz) in _initial_obstacle_poses.items():
+            if name in obstacle_frames:
+                obstacle_frames[name].position = pos
+                obstacle_frames[name].wxyz = wxyz
+            if name in tracked_frames:
+                restored = Pose.from_numpy(np.array(pos, dtype=np.float32), np.array(wxyz, dtype=np.float32))
+                planner.scene_collision_checker.update_obstacle_pose(name, restored)
+                old_obstacle_poses[name] = restored.clone()
         try:
             server.scene.remove_by_name("/collision_spheres")
         except Exception:
