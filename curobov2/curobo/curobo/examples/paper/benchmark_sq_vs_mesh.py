@@ -88,7 +88,11 @@ def scene_geometry(n: int) -> Tuple[float, float, float, float]:
     """
     inner_r = 0.28
     outer_r = max(0.65, 0.28 + 0.6 * math.sqrt(n / 10.0))
-    object_size_m = 0.18 if n <= 25 else (0.15 if n <= 100 else 0.12)
+    if n == 50:
+        outer_r = 1.2
+    elif n == 200:
+        outer_r = 2.0
+    object_size_m = 0.27 if n <= 25 else (0.225 if n <= 100 else 0.18)
     table_half = outer_r + 0.20
     return inner_r, outer_r, table_half, object_size_m
 
@@ -166,7 +170,7 @@ def build_benchmark_scene(
     centers = demo._place_on_table(
         n, rng,
         inner_r=inner_r, outer_r=outer_r,
-        min_sep=object_size_m * 2.0 * 0.6,   # allow minor overlap (not conservative)
+        min_sep=object_size_m * 2.0 * 0.12,   # 5x tighter than original
     )
 
     pred_cache: Dict[int, Optional[_CachedPred]] = {}   # model idx -> cached pred or None (bad)
@@ -221,10 +225,6 @@ def _scene_predictions(scene: dict) -> List[demo.SuperDecPrediction]:
 
 def cmd_build(args: argparse.Namespace) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    if SCENES_CACHE.exists() and not args.force:
-        print(f"Scene cache already exists at {SCENES_CACHE} (use --force to rebuild).")
-        return
-
     wp.init()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Loading ShapeNet dataset…")
@@ -277,7 +277,7 @@ def cmd_set_targets(args: argparse.Namespace) -> None:
         visualize_robot_spheres=False,
     )
     server = viser_viz._server
-    state = {"scene_idx": 0, "overlays": []}
+    state = {"scene_idx": 0, "overlays": [], "planner": None, "planner_scene_idx": -1}
 
     def _scene_name(i: int) -> str:
         return scenes[i]["name"]
@@ -333,6 +333,8 @@ def cmd_set_targets(args: argparse.Namespace) -> None:
     recall_dd = server.gui.add_dropdown(
         "Recall target", options=["-"] + [f"T{i + 1}" for i in range(N_TARGETS)], initial_value="-"
     )
+    move_btn = server.gui.add_button("Move to current pose", color="blue")
+    move_status_md = server.gui.add_markdown("")
     write_btn = server.gui.add_button("Write targets.json", color="green")
 
     _redraw(0)
@@ -340,6 +342,7 @@ def cmd_set_targets(args: argparse.Namespace) -> None:
     @scene_dd.on_update
     def _(_e) -> None:
         state["scene_idx"] = [s["name"] for s in scenes].index(scene_dd.value)
+        state["planner"] = None   # invalidate cached planner for new scene
         _redraw(state["scene_idx"])
         status_md.content = _status_text()
 
@@ -368,6 +371,58 @@ def cmd_set_targets(args: argparse.Namespace) -> None:
         name = _scene_name(state["scene_idx"])
         if name in targets and slot < len(targets[name]):
             _set_frame_pose(targets[name][slot])
+
+    @move_btn.on_click
+    def _(_e) -> None:
+        import threading
+
+        def _plan_and_animate() -> None:
+            scene_idx = state["scene_idx"]
+            scene = scenes[scene_idx]
+
+            if state["planner"] is None or state["planner_scene_idx"] != scene_idx:
+                move_status_md.content = "_Building planner for this scene…_"
+                preds = _scene_predictions(scene)
+                demo.TABLE = _make_table(scene_geometry(scene["n_objects"])[2])
+                scene_cfg = demo._prediction_to_scene_cfg(
+                    preds, "superquadrics", 1.0,
+                    demo.SCENE_TRANSLATION, demo.SCENE_QUAT_WXYZ, torch.zeros(1),
+                )
+                device_cfg = DeviceCfg(device="cuda" if torch.cuda.is_available() else "cpu")
+                state["planner"] = demo._rebuild_planner(scene_cfg, "superquadrics", device_cfg)
+                state["planner_scene_idx"] = scene_idx
+
+            planner = state["planner"]
+            h = _frame_handle()
+            pose7 = [*[float(x) for x in h.position], *[float(x) for x in h.wxyz]]
+
+            move_status_md.content = "_Planning…_"
+            tool_frame = planner.kinematics.tool_frames[0]
+            goal = GoalToolPose.from_poses(
+                {tool_frame: Pose.from_list(pose7)}, num_goalset=1
+            )
+            current_js = planner.default_joint_state.clone().unsqueeze(0)
+            active_js = planner.kinematics.get_active_js(current_js)
+
+            try:
+                result = planner.plan_pose(
+                    goal, active_js, use_implicit_goal=True, max_attempts=3
+                )
+            except Exception as exc:
+                move_status_md.content = f"**Plan error:** {exc}"
+                return
+
+            if result is None or not result.success.any():
+                move_status_md.content = "**Unreachable — no plan found.**"
+                return
+
+            move_status_md.content = "_Animating…_"
+            interp = result.get_interpolated_plan()
+            interp = planner.kinematics.get_active_js(interp)
+            _animate(viser_viz, interp)
+            move_status_md.content = "Reached."
+
+        threading.Thread(target=_plan_and_animate, daemon=True).start()
 
     @write_btn.on_click
     def _(_e) -> None:
