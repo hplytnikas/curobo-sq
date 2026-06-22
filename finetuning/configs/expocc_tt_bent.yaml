@@ -1,0 +1,129 @@
+# Fine-tune the BENT (extended) superquadric model on tabletop+GSO.
+#
+# Starts from the supervisor's extended checkpoint (expocc2 / expocc2.1 line,
+# trained on ShapeNet + ABO-partial) and fine-tunes it on our tabletop+GSO
+# data for better fitting with tapering + bending deformations.
+#
+# Key differences vs configs/expocc_tt.yaml (the rigid student):
+#   - superdec.extended: true        -> tapering + bending heads active ("bent ones")
+#   - superdec.rotation6d: false     -> MATCHES the checkpoint's 4-D quat rot_head.
+#                                       Setting true would make superdec.py delete &
+#                                       re-init the rotation head -> relearn from scratch.
+#   - loss.type: iou                 -> IoULoss. sdf_batch is bending-aware, so the
+#                                       bent primitives are fit directly to occupancy GT.
+#                                       'geom' is NOT usable here: it supervises against
+#                                       GT tapering/bending, which our rigid-teacher
+#                                       pseudo-GT has as zero -> would un-bend the model.
+#
+# >>> BEFORE RUNNING: place the supervisor's checkpoint and set resume_from below. <<<
+
+seed: 42
+use_wandb: true
+wandb:
+  project: superdec
+  entity: eyluloykusen
+run_name: expocc_tt_bent
+dataset: shapenet
+device: cuda
+
+checkpoints:
+  # Supervisor's expocc2.1 run, 100 epochs (bent model, ShapeNet + ABO-partial).
+  resume_from: checkpoints/expocc2.1/epoch_100.pt
+  keep_epoch: false               # fresh fine-tune: restart epoch counter + LR schedule
+
+superdec:
+  extended: true                  # bent superquadrics: tapering + bending heads
+  extended_non_zero_init: true    # ignored on resume (checkpoint already has trained
+                                  # tapering/bending heads); only used if they were missing
+  rotation6d: false               # must match the checkpoint (4-D quaternion rot_head)
+  decoder:
+    n_queries: 16
+    n_layers: 3
+    n_heads: 1
+    masked_attention: false
+    swapped_attention: false
+    dim_feedforward: 512
+    deep_supervision: false
+    pos_encoding_type: sinusoidal
+  point_encoder:
+    in_channels: 3
+    out_channels: 128
+    kernel_size: 3
+    resolution: 32
+    voxelization:
+      normalize: true
+      eps: 0
+    l1:
+      in_channels: 3
+      out_channels: 64
+      kernel_size: 3
+      resolution: 32
+      voxelization:
+        normalize: true
+        eps: 0
+    l2:
+      in_channels: 64
+      out_channels: 128
+      kernel_size: 3
+      resolution: 16
+      voxelization:
+        normalize: true
+        eps: 0
+    l3:
+      in_channels: 128
+      out_channels: 128
+      kernel_size: 3
+      resolution: 16
+      voxelization:
+        normalize: true
+        eps: 0
+
+shapenet:
+  path: data/ShapeNet
+  categories: null
+  normalize: true
+  load_occupancy: true            # REQUIRED by IoULoss (points_iou + occupancies)
+  use_fps: false                  # random subsampling so augmentation sees diverse views
+  # No gt_*_path / filter: IoULoss supervises purely from occupancy, so no
+  # pseudo-GT is needed. Training on the full object set (not the rigid-IoU
+  # balanced top-50%) keeps the curved/hard objects that bending fixes best.
+
+trainer:
+  save_path: checkpoints
+  save_every_n_epochs: 25
+  num_epochs: 100                 # short fine-tune; bump if fitting still improves
+  batch_size: 16                  # 32 OOMs the 16GB 5060ti -- the bent IoU sdf_batch
+                                  # retains many (B,N,M_iou) intermediates for autograd
+  num_workers: 8
+  evaluate_every_n_epochs: 10
+  augmentations: true
+  occlusions: true
+  rotation_limits: [3.14159265, 3.14159265, 3.14159265]   # full SO(3) (X, Y, Z)
+
+optimizer:
+  lr: 1e-4                        # supervisor's expocc2.1 recipe; lower to 5e-5 for a gentler fine-tune
+  weight_decay: 0
+  betas: [0.9, 0.999]
+  enable_scheduler: true
+  only_heads: false
+  all_but_heads: false
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.OneCycleLR
+  max_lr: ${optimizer.lr}
+  epochs: ${trainer.num_epochs}
+  steps_per_epoch: -1             # auto-computed from the dataloader (avoids hardcoding)
+
+loss:
+  type: iou                       # IoULoss -- bending-aware SDF + volumetric IoU
+  leaky_relu: 0.1
+  truncation: 0.05
+  w_sdf: 0.2                      # surface points -> SDF~=0 of assigned primitive
+  w_iou: 0.2                      # volumetric IoU vs occupancy GT
+  w_bbox: 0.0                     # disabled
+  w_overlap: 5.0                  # strong penalty for primitives overlapping
+  w_sps: 1.26                     # sparsity (use fewer primitives)
+  w_ext: 0.02                     # existence head regularization
+
+visualization:
+  res_primitives: 40

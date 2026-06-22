@@ -1,0 +1,119 @@
+# Teacher training (Chamfer variant): rigid SuperDec on tabletop+GSO with the
+# v3 recipe (Chamfer + low sparsity + low cuboid weight). Forked from
+# configs/exp_tt.yaml to replace the IoU+SDF teacher.
+#
+# Why this exists:
+# - The released foundation (checkpoints/shapenet_foundation/ckpt.pt) was
+#   trained with the original Chamfer-based SuperDec loss. The IoU+SDF
+#   teacher in exp_tt.yaml introduces a loss-family mismatch with that init.
+# - Empirically v3 (same Chamfer recipe, fine-tuned from the same foundation)
+#   produced 5-7 well-placed primitives per mug including handle coverage.
+#   Our IoU+SDF teacher collapses handle/rim coverage because volume-based
+#   loss does not reward thin features when deformations are disabled.
+# - We must keep extended=false (rigid SQs) for cuRobo compatibility, so we
+#   cannot rely on the paper's extended primitives to cover handles.
+#
+# Resume target: checkpoints/shapenet_foundation/ckpt.pt
+# Outputs pseudo-GT for the student stage (expocc_tt_chamfer.yaml) after
+# Phase C (test-time optim + to_npz + batch_evaluate + rebalance).
+
+seed: 42
+use_wandb: true
+wandb:
+  project: superdec
+  entity: eyluloykusen
+run_name: exp_tt_chamfer
+dataset: shapenet
+device: cuda
+
+checkpoints:
+  resume_from: checkpoints/shapenet_foundation/ckpt.pt
+  keep_epoch: false
+
+superdec:
+  extended: false              # rigid SQs only, cuRobo-compatible
+  extended_non_zero_init: true # ignored when extended=false
+  rotation6d: false            # match foundation's quat head
+  decoder:
+    n_queries: 16
+    n_layers: 3
+    n_heads: 1
+    masked_attention: false
+    swapped_attention: false
+    dim_feedforward: 512
+    deep_supervision: False
+    pos_encoding_type: sinusoidal
+  point_encoder:
+    in_channels: 3
+    out_channels: 128
+    kernel_size: 3
+    resolution: 32
+    voxelization:
+      normalize: True
+      eps: 0
+    l1:
+      in_channels: 3
+      out_channels: 64
+      kernel_size: 3
+      resolution: 32
+      voxelization:
+        normalize: True
+        eps: 0
+    l2:
+      in_channels: 64
+      out_channels: 128
+      kernel_size: 3
+      resolution: 16
+      voxelization:
+        normalize: True
+        eps: 0
+    l3:
+      in_channels: 128
+      out_channels: 128
+      kernel_size: 3
+      resolution: 16
+      voxelization:
+        normalize: True
+        eps: 0
+
+shapenet:
+  path: data/ShapeNet
+  categories: null            # 5 tabletop + gso (auto-discovered)
+  normalize: false            # match foundation + v3 (do NOT normalize twice)
+  load_occupancy: false       # not used by Chamfer loss
+
+trainer:
+  save_path: checkpoints
+  save_every_n_epochs: 25
+  num_epochs: 500             # v3 used 300 from the same init; we keep some
+                              # headroom for the larger (5cat+gso) dataset.
+  batch_size: 32
+  num_workers: 8
+  evaluate_every_n_epochs: 10
+  augmentations: True         # near-canonical aug (default)
+  occlusions: False           # full clouds for the teacher
+
+optimizer:
+  lr: 1e-4
+  weight_decay: 0
+  betas: [0.9, 0.999]
+  enable_scheduler: True
+  only_heads: False
+  all_but_heads: False
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.OneCycleLR
+  max_lr: ${optimizer.lr}
+  epochs: ${trainer.num_epochs}
+  steps_per_epoch: -1
+
+loss:
+  type: original              # SuperDecLoss: Chamfer + cuboid + sparsity + existence
+  n_samples: 500
+  w_cd: 1.0
+  w_cub: 0.1                  # v3 (foundation used 1.0; v3 lowered to let primitives stretch into handles)
+  w_sps: 0.1                  # v3 (foundation used 0.6; v3 lowered for ~5-7 primitives/object)
+  w_ext: 0.01                 # v3
+
+visualization:
+  res_primitives: 40
