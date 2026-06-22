@@ -37,7 +37,7 @@ uv venv --python 3.11
 source .venv/bin/activate
 
 cd ../curobov2/curobo
-uv pip install .[cu13-torch]
+SETUPTOOLS_SCM_PRETEND_VERSION=0.0.1 uv pip install .[cu13-torch]
 
 cd - 
 cd ../project_3dv
@@ -53,7 +53,7 @@ Finally, simply run the following commands in this directory.
 
 ``` sh
 . /opt/ros/jazzy/setup.bash
-colcon build
+colcon build --cmake-args -DBUILD_TESTS=OFF
 ```
 
 ### Running the demo
