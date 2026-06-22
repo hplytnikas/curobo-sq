@@ -103,12 +103,12 @@ no checkpoint and no ShapeNet are required.
 
 ### 2. Run - fast path (only `scenes_cache.pkl`)
 
-Reproduces the benchmark numbers and figures with no checkpoint or ShapeNet:
+Reproduces the benchmark numbers and figures with no checkpoint or ShapeNet (run inside the 3dv conda environment):
 
 ```bash
-conda run -n 3dv python benchmark_sq_vs_mesh.py benchmark   # → eval_out/results.csv
-conda run -n 3dv python plot_benchmark.py                   # → eval_out/objects_vs_*.png
-conda run -n 3dv python plot_benchmark_paper.py             # → eval_out/paper_*.png
+python benchmark_sq_vs_mesh.py benchmark   # → eval_out/results.csv
+python plot_benchmark.py                   # → eval_out/objects_vs_*.png
+python plot_benchmark_paper.py             # → eval_out/paper_*.png
 ```
 
 ### 3. Run - full pipeline (needs `ShapeNet_test` + `tabletop_finetuned`)
@@ -120,12 +120,12 @@ Regenerates every scene from the dataset and re-runs SuperDec inference:
 conda run -n 3dv python motion_planning_sq_demo.py
 
 # Benchmark, in order: build scenes → set 4 targets/scene → plan SQ vs mesh
-conda run -n 3dv python benchmark_sq_vs_mesh.py build          # Builds random scenes → data/paper/scenes_cache.pkl
-conda run -n 3dv python benchmark_sq_vs_mesh.py set-targets    # GUI for setting targets → eval_out/targets.json
-conda run -n 3dv python benchmark_sq_vs_mesh.py benchmark      # Runs the benchmark for planning time → eval_out/results.csv
+python benchmark_sq_vs_mesh.py build          # Builds random scenes → data/paper/scenes_cache.pkl
+python benchmark_sq_vs_mesh.py set-targets --port 8080   # GUI for setting targets → eval_out/targets.json
+python benchmark_sq_vs_mesh.py benchmark      # Runs the benchmark for planning time → eval_out/results.csv
 
 # Sofa-scaling benchmark (needs data/paper/chair.ply)
-conda run -n 3dv python benchmark_sofa_scaling.py --counts 1,3,6,21,51
+python benchmark_sofa_scaling.py --counts 1,3,6,21,51
 ```
 
 Restrict object counts with `--counts 1,5,10`; the mesh-fidelity sweep is
