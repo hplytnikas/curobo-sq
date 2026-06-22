@@ -44,8 +44,8 @@ cd ../project_3dv
 uv pip install -e .
 ```
 
-The demo also depends on SuperDec. After acquiring a copy of the source code,
-also install it into the venv.
+The demo also depends on SuperDec/Superflex. After acquiring a copy of the source code,
+also install it into the venv as described in the finetuning section of this repo.
 
 ### Building the workspace
 
