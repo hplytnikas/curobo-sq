@@ -31,11 +31,6 @@ Scene (CuRobo / planning interface)
 -------------------------------------
     Scene                 Wraps Superquadrics; .get_signed_distance() for cuRobo
     sq_fits_to_npz        Export SuperquadricFit list to SuperDec .npz format
-
-Grasp planning
----------------
-    GraspSelector         Per-primitive grasp candidates for Franka Panda
-    GraspCandidate        Single grasp (pose, gripper_width, score)
 """
 
 from .pipeline import (
@@ -73,10 +68,6 @@ from .superdec_utils import (
     Scene,
     Superquadrics,
     sq_fits_to_npz,
-)
-from .grasp_from_sq import (
-    GraspSelector,
-    GraspCandidate,
 )
 
 # SuperdecFitter requires torch + the superdec package; import lazily to avoid
@@ -121,7 +112,4 @@ __all__ = [
     "Scene",
     "Superquadrics",
     "sq_fits_to_npz",
-    # grasp planning
-    "GraspSelector",
-    "GraspCandidate",
 ]
