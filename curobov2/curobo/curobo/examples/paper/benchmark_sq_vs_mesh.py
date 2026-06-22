@@ -165,6 +165,12 @@ class _CachedPred:
 
 def _per_sq_meshes(outdict: dict, resolution: int) -> List[Tuple[np.ndarray, np.ndarray]]:
     """Tessellate each existing superquadric of an object into its own mesh."""
+    # ``from_outdict`` calls ``.cpu().numpy()`` on every value, so coerce any
+    # numpy arrays (e.g. after ``_place_cached``) back to tensors first.
+    outdict = {
+        k: (torch.as_tensor(v) if isinstance(v, np.ndarray) else v)
+        for k, v in outdict.items()
+    }
     handler = PredictionHandler.from_outdict(outdict, torch.zeros(1, 1, 3), ["0"])
     meshes: List[Tuple[np.ndarray, np.ndarray]] = []
     P = handler.scale.shape[1]
