@@ -154,7 +154,10 @@ docker/pkgs/*
 *.usd
 *.usda
 *.csv
+# but DO track the benchmark results so runs are versioned
+!curobo/examples/paper/eval_out/results.csv
 *.json
+!curobo/examples/paper/eval_out/targets.json
 *.SLDPRT
 *.xacro
 *.gazebo

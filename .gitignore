@@ -200,6 +200,9 @@ nvidia_curobo*/
 *tfevents*
 
 *.csv
+# but DO track the benchmark results so runs are versioned
+!curobov2/curobo/curobo/examples/paper/eval_out/results.csv
+!curobov2/curobo/curobo/examples/paper/eval_out/targets.json
 docs/*
 
 # Builds
