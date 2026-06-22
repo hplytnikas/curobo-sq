@@ -1,0 +1,25 @@
+# Forward the trained teacher over tabletop+GSO to dump raw predictions
+# into data/output_npz/<source_folder>/shapenet_<split>.npz.
+# Usage:
+#   python -m superdec.evaluate.to_npz --config-path=../../configs/optim_tt \
+#     dataloader.split=train
+#   python -m superdec.evaluate.to_npz --config-path=../../configs/optim_tt \
+#     dataloader.split=val
+
+checkpoints_folder: checkpoints/exp_tt
+checkpoint_file: epoch_1000.pt
+output_dir: data/output_npz/exp_tt
+config_file: config.yaml
+device: cuda
+dataset: shapenet
+dataloader:
+  split: train
+  batch_size: 64
+  num_workers: 4
+shapenet:
+  path: data/ShapeNet
+  normalize: false       # to_npz then denormalizes; the eval pipeline expects raw-frame outputs
+  categories: null
+  use_fps: true          # deterministic FPS subsample for stable pseudo-GT
+evaluation:
+  resolution: 50

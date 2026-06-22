@@ -1,0 +1,13 @@
+[project]
+name = "project-3dv"
+version = "0.1.0"
+description = "Course Project for 3DV"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+project-3dv = "project_3dv:main"
+
+[build-system]
+requires = ["uv_build>=0.10.6,<0.11.0"]
+build-backend = "uv_build"

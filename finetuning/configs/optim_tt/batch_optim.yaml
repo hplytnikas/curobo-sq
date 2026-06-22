@@ -1,0 +1,41 @@
+# Test-time optimization (per-shape) on top of teacher predictions to produce
+# high-quality pseudo-GT for the student stage.
+# RIGID-only: tapering/bending disabled because cuRobo only handles rigid SQs
+# and our student is also rigid; we don't want pseudo-GT with deformation
+# fields the student can't represent.
+#
+# Usage:
+#   python -m superoptim.batch_evaluate \
+#     --config-path=../configs/optim_tt --config-name=batch_optim \
+#     +source_folder=exp_tt
+#   python -m superoptim.batch_evaluate \
+#     --config-path=../configs/optim_tt --config-name=batch_optim \
+#     +source_folder=exp_tt shapenet.split=val
+#
+# Output:
+#   data/output_npz/exp_tt/iou/{train,val}.npz   (optimized pseudo-GT)
+#   data/output_npz/exp_tt/iou/{train,val}_metrics.csv  (per-shape IoU/CD)
+
+type: iou
+small: false
+num_epochs: 1000
+device: cuda
+
+optimization:
+  tapering: false   # rigid pipeline
+  bending:  false
+  reorient: false
+  pruning:  false
+
+dataloader:
+  dataset: shapenet
+  batch_size: 64
+  num_workers: 8
+
+shapenet:
+  split: train
+  path: data/ShapeNet
+  categories: null
+  load_occupancy: true
+  use_fps: true
+  normalize: false      # keep raw mesh coordinates so per-object IoU/CD compute against the right frame

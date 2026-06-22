@@ -1,41 +1,32 @@
 #!/usr/bin/env python3
 
 from typing import List, Sequence, Tuple
+import traceback
+import os
+
+import torch
+from scipy.spatial.transform import Rotation as SciRotation
+from omegaconf import OmegaConf
+import numpy as np
+from superdec.superdec import SuperDec
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 
-# Standard Sensor and Geometry Messages
 from sensor_msgs.msg import Image, PointCloud2, PointField
 from geometry_msgs.msg import TransformStamped
 
-# TF2 imports for transforming perception data into your target frame
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 
-# Placeholders for your future custom message layout
-# Once defined, uncomment and update these lines:
-from superquadric_interfaces.msg import Superquadric, SuperquadricArray, SceneObject, Scene
-
-from scipy.spatial.transform import Rotation as SciRotation
-
 from project_3dv.perception.pipeline import depth_to_pointcloud, remove_table, segment_instances_dual, preprocess_pointcloud, SuperquadricWorld
-
 from project_3dv.perception.pipeline import Frame, get_world_pointcloud, fit_superquadrics_world
-
+from project_3dv.perception.paths import superdec_dir, superdec_checkpoint_dir
 from project_3dv.perception.superdec_fitter import SuperdecFitter
 
-import torch
-from superdec.superdec import SuperDec
-from omegaconf import OmegaConf
-
-import numpy as np
-
-import traceback
-
-import os
+from superquadric_interfaces.msg import Superquadric, SuperquadricArray, SceneObject, Scene
 
 # these converters are necessary because we use a venv's python which provides numpy>=2
 
@@ -267,8 +258,8 @@ class SuperquadricFitterNode(Node):
         )
 
         # configure perception pipeline
-        checkpoint_folder = "/home/vision/Downloads/concave_checkpoint/"
-        self.fitter = SuperdecFitter("/home/vision/Downloads/superdec/", checkpoint_folder)
+        checkpoint_folder = superdec_checkpoint_dir()
+        self.fitter = SuperdecFitter(superdec_dir(), checkpoint_folder)
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         checkpoint = torch.load(os.path.join(checkpoint_folder, "ckpt.pt"), map_location=self.device, weights_only=False)

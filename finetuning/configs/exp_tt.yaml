@@ -1,0 +1,113 @@
+# Teacher training: rigid SuperFlex on tabletop+GSO, unsupervised IoU+SDF loss.
+# Forked from configs/expabo0.yaml; matches the paper's exp3 recipe (the
+# foundation that all paper runs build on) but retargeted to our 5 ShapeNet
+# tabletop categories + GSO instead of ShapeNet-13 / ABO.
+#
+# Resume target: checkpoints/shapenet_foundation/ckpt.pt
+# (the released SuperDec ShapeNet-13 rigid checkpoint, rotation6d=false).
+#
+# Outputs pseudo-GT for the student stage after Phase C (test-time optim).
+
+seed: 42
+use_wandb: true
+wandb:
+  project: superdec
+  entity: null            # set to your wandb entity (or run with use_wandb: false)
+run_name: exp_tt
+dataset: shapenet
+device: cuda
+
+checkpoints:
+  resume_from: checkpoints/shapenet_foundation/ckpt.pt
+  keep_epoch: false
+
+superdec:
+  extended: false              # rigid SQs only, cuRobo-compatible
+  extended_non_zero_init: true # ignored when extended=false; harmless
+  rotation6d: false            # match foundation's quat head
+  decoder:
+    n_queries: 16
+    n_layers: 3
+    n_heads: 1
+    masked_attention: false
+    swapped_attention: false
+    dim_feedforward: 512
+    deep_supervision: False
+    pos_encoding_type: sinusoidal
+  point_encoder:
+    in_channels: 3
+    out_channels: 128
+    kernel_size: 3
+    resolution: 32
+    voxelization:
+      normalize: True
+      eps: 0
+    l1:
+      in_channels: 3
+      out_channels: 64
+      kernel_size: 3
+      resolution: 32
+      voxelization:
+        normalize: True
+        eps: 0
+    l2:
+      in_channels: 64
+      out_channels: 128
+      kernel_size: 3
+      resolution: 16
+      voxelization:
+        normalize: True
+        eps: 0
+    l3:
+      in_channels: 128
+      out_channels: 128
+      kernel_size: 3
+      resolution: 16
+      voxelization:
+        normalize: True
+        eps: 0
+
+shapenet:
+  path: data/ShapeNet
+  categories: null            # null = auto-discover all subdirs (5 tabletop + gso)
+  normalize: True
+  load_occupancy: True        # required for IoU loss; needs points.npz per object
+
+trainer:
+  save_path: checkpoints
+  save_every_n_epochs: 50     # 1000/50 = 20 checkpoints
+  num_epochs: 1000            # paper recipe (matches expabo0/exp3 fine-tune duration)
+  batch_size: 32
+  num_workers: 8
+  evaluate_every_n_epochs: 10
+  augmentations: True         # near-canonical aug (X/Z = pi/24, Y = pi)
+  occlusions: False           # full clouds for the teacher
+
+optimizer:
+  lr: 1e-4
+  weight_decay: 0
+  betas: [0.9, 0.999]
+  enable_scheduler: True
+  only_heads: False
+  all_but_heads: False
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.OneCycleLR
+  max_lr: ${optimizer.lr}
+  epochs: ${trainer.num_epochs}
+  steps_per_epoch: -1
+
+loss:
+  type: iou
+  w_sps: 1.26
+  w_ext: 0.02
+
+  # IoU+SDF block (paper expabo0 / exp3 weights)
+  truncation: 0.05
+  w_sdf: 0.2
+  w_bbox: 0.0
+  w_iou: 0.2
+  w_overlap: 5.0
+
+visualization:
+  res_primitives: 40
