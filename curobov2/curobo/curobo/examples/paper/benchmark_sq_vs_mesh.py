@@ -67,6 +67,13 @@ OUT_DIR = Path(__file__).resolve().parent / "eval_out"
 SCENES_CACHE = OUT_DIR / "scenes_cache.pkl"
 TARGETS_JSON = OUT_DIR / "targets.json"
 RESULTS_CSV = OUT_DIR / "results.csv"
+RESULTS_FIDELITY_CSV = OUT_DIR / "results_fidelity.csv"
+
+# Mesh-fidelity sweep (tessellation grid resolution N for each superquadric).
+# Triangle count per superquadric grows ~2*(N-1)**2, so cost rises steeply with N
+# while the analytic SQ kernel is fidelity-independent.  Levels go low -> high; the
+# middle of the default sweep (~48) matches the build-time `--mesh_resolution`.
+DEFAULT_FIDELITY_LEVELS = [8, 16, 32, 48, 64]
 
 OBJECT_COUNTS = [1, 5, 10, 15, 25, 50, 100, 200]
 N_TARGETS = 4                       # targets per scene (sequential tour waypoints)
@@ -112,6 +119,10 @@ BENCH_FIELDNAMES = [
     "n_steps_total", "n_steps_collide", "n_spheres_collide",
     "frac_in_collision", "max_penetration_m",
 ]
+
+# Fidelity sweep adds the mesh tessellation resolution and resulting triangle count
+# (0 / 0 for the analytic superquadric baseline rows).
+FIDELITY_FIELDNAMES = BENCH_FIELDNAMES + ["mesh_resolution", "n_triangles"]
 
 
 def scene_geometry(n: int) -> Tuple[float, float, float, float]:
@@ -343,6 +354,28 @@ def _scene_predictions(scene: dict) -> List[demo.SuperDecPrediction]:
         mesh = _fuse_meshes(p["sq_meshes"])
         preds.append(demo.SuperDecPrediction(iid=p["iid"], outdict=p["outdict"], mesh=mesh))
     return preds
+
+
+def _scene_predictions_at_res(scene: dict, resolution: int) -> List[demo.SuperDecPrediction]:
+    """Like ``_scene_predictions`` but re-tessellates each SQ at ``resolution``.
+
+    The cached ``sq_meshes`` are fixed at the build-time resolution; to sweep mesh
+    fidelity we re-tessellate from the (already placed) ``outdict`` so the mesh
+    obstacles get progressively finer triangle grids while staying in world frame.
+    """
+    preds = []
+    for p in scene["predictions"]:
+        sq_meshes = _per_sq_meshes(p["outdict"], resolution)
+        mesh = _fuse_meshes(sq_meshes)
+        preds.append(demo.SuperDecPrediction(iid=p["iid"], outdict=p["outdict"], mesh=mesh))
+    return preds
+
+
+def _count_mesh_triangles(scene_cfg: SceneCfg) -> int:
+    """Total triangle count across all mesh obstacles in a SceneCfg (0 if none)."""
+    if scene_cfg.mesh is None:
+        return 0
+    return sum(len(m.faces) for m in scene_cfg.mesh)
 
 
 def cmd_build(args: argparse.Namespace) -> None:
@@ -617,24 +650,34 @@ def _interp_positions_per_step(interp: JointState) -> torch.Tensor:
     return pos
 
 
-def _build_scene_cfg(scene: dict, representation: str) -> Tuple[SceneCfg, int]:
-    """Build the collision SceneCfg for one representation; return (cfg, n_primitives).
+def _build_scene_cfg(
+    scene: dict, representation: str, mesh_resolution: Optional[int] = None,
+) -> Tuple[SceneCfg, int, int]:
+    """Build the collision SceneCfg for one representation.
+
+    Returns ``(cfg, n_primitives, n_triangles)`` where ``n_triangles`` is the total
+    triangle count of all mesh obstacles (0 for the analytic superquadric mode).
 
     superquadrics  one Superquadric per primitive (via demo._prediction_to_scene_cfg)
-    mesh           one fused Mesh per object (same as demo._prediction_to_scene_cfg)
+    mesh           one fused Mesh per object; if ``mesh_resolution`` is given the SQ
+                   surfaces are re-tessellated at that grid resolution (fidelity sweep)
     shapenet_mesh  one Mesh per object, from the original ShapeNet mesh
     """
     table = _make_table(scene_geometry(scene["n_objects"])[2])
     demo.TABLE = table  # demo._prediction_to_scene_cfg reads this global
 
     if representation in ("superquadrics", "mesh"):
+        if representation == "mesh" and mesh_resolution is not None:
+            preds = _scene_predictions_at_res(scene, mesh_resolution)
+        else:
+            preds = _scene_predictions(scene)
         cfg = demo._prediction_to_scene_cfg(
-            _scene_predictions(scene), representation, 1.0,
+            preds, representation, 1.0,
             demo.SCENE_TRANSLATION, demo.SCENE_QUAT_WXYZ, torch.zeros(1),
         )
         n = (demo._count_items(cfg.superquadric) if representation == "superquadrics"
              else demo._count_items(cfg.mesh))
-        return cfg, n
+        return cfg, n, _count_mesh_triangles(cfg)
 
     meshes: List[Mesh] = []
     if representation == "pointcloud":
@@ -659,15 +702,22 @@ def _build_scene_cfg(scene: dict, representation: str) -> Tuple[SceneCfg, int]:
 
     cfg = SceneCfg(cuboid=[table], mesh=meshes)
     print(f"Built scene: {len(meshes)} {representation} mesh primitive(s)")
-    return cfg, len(meshes)
+    return cfg, len(meshes), _count_mesh_triangles(cfg)
 
 
 def benchmark_one(
     scene: dict, representation: str, targets: List[List[float]],
     device_cfg: DeviceCfg, tree: cKDTree, visualize, args,
+    mesh_resolution: Optional[int] = None,
 ) -> List[dict]:
-    """Run the sequential tour for one (scene, representation). Returns per-leg rows."""
-    scene_cfg, n_primitives = _build_scene_cfg(scene, representation)
+    """Run the sequential tour for one (scene, representation). Returns per-leg rows.
+
+    ``mesh_resolution`` (fidelity sweep only) re-tessellates the mesh obstacles at the
+    given grid resolution; it is recorded on every row along with the triangle count.
+    """
+    scene_cfg, n_primitives, n_triangles = _build_scene_cfg(
+        scene, representation, mesh_resolution
+    )
     planner = demo._rebuild_planner(scene_cfg, _PLANNER_REP[representation], device_cfg)
     tool_frame = planner.kinematics.tool_frames[0]
 
@@ -721,6 +771,8 @@ def benchmark_one(
             "n_spheres_collide": 0,
             "frac_in_collision": float("nan"),
             "max_penetration_m": float("nan"),
+            "mesh_resolution": int(mesh_resolution) if mesh_resolution is not None else 0,
+            "n_triangles": n_triangles,
         }
 
         if success:
@@ -813,11 +865,69 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
             all_rows.extend(rows)
 
     with open(RESULTS_CSV, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for r in all_rows:
             writer.writerow(r)
     print(f"\nWrote {len(all_rows)} rows to {RESULTS_CSV}")
+
+
+def cmd_benchmark_fidelity(args: argparse.Namespace) -> None:
+    """Mesh-fidelity sweep: hold the scene fixed and vary mesh tessellation resolution.
+
+    For each scene we plan the same sequential tour once with the analytic superquadric
+    representation (the fidelity-independent baseline) and once per fidelity level with
+    the mesh representation, re-tessellating each SQ surface to a finer triangle grid as
+    the level increases.  This isolates the effect of mesh fidelity on planning cost and
+    lets ``plot_fidelity.py`` show the SQ-vs-mesh speedup growing with fidelity.
+    Results are written to ``eval_out/results_fidelity.csv``.
+    """
+    wp.init()
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    scenes = _load_scenes()
+    targets = _load_targets()
+    if not targets:
+        raise SystemExit(f"No targets at {TARGETS_JSON}. Run the 'set-targets' subcommand first.")
+
+    if args.counts:
+        scenes = [s for s in scenes if s["n_objects"] in args.counts]
+
+    levels = sorted(set(args.fidelity)) if args.fidelity else list(DEFAULT_FIDELITY_LEVELS)
+    print(f"Fidelity sweep over mesh tessellation resolutions: {levels}")
+
+    device_cfg = DeviceCfg(device=args.device)
+    all_rows: List[dict] = []
+
+    for scene in scenes:
+        scene_targets = targets.get(scene["name"])
+        if not scene_targets:
+            print(f"[skip] {scene['name']}: no saved targets")
+            continue
+        all_pts = np.concatenate(scene["object_pts"]).astype(np.float32)
+        tree = cKDTree(all_pts)
+        print(f"\n=== {scene['name']} ({scene['n_objects']} objects, "
+              f"{len(all_pts)} points) ===")
+
+        # Fidelity-independent analytic baseline (recorded with resolution/triangles = 0).
+        print(f"  [superquadrics] analytic baseline")
+        all_rows.extend(
+            benchmark_one(scene, "superquadrics", scene_targets, device_cfg, tree, None, args)
+        )
+
+        # Mesh representation at each tessellation resolution, low -> high.
+        for res in levels:
+            print(f"  [mesh] tessellation resolution N={res}")
+            all_rows.extend(
+                benchmark_one(scene, "mesh", scene_targets, device_cfg, tree, None, args,
+                              mesh_resolution=res)
+            )
+
+    with open(RESULTS_FIDELITY_CSV, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIDELITY_FIELDNAMES, extrasaction="ignore")
+        writer.writeheader()
+        for r in all_rows:
+            writer.writerow(r)
+    print(f"\nWrote {len(all_rows)} rows to {RESULTS_FIDELITY_CSV}")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────────
@@ -854,6 +964,13 @@ def main() -> None:
     p_bench.add_argument("--device", type=str, default="cuda")
     p_bench.add_argument("--visualize", action="store_true", help="Animate runs in viser")
     p_bench.add_argument("--port", type=int, default=8082)
+    p_bench.add_argument(
+        "--fidelity", type=_parse_counts, nargs="?", const=list(DEFAULT_FIDELITY_LEVELS),
+        default=None,
+        help="Run the mesh-fidelity sweep instead of the standard benchmark. Optionally "
+             "give a comma-separated list of mesh tessellation resolutions (low->high), "
+             f"e.g. --fidelity 8,16,32,48,64 (default: {','.join(map(str, DEFAULT_FIDELITY_LEVELS))}).",
+    )
 
     args = parser.parse_args()
     if args.command == "build":
@@ -861,7 +978,10 @@ def main() -> None:
     elif args.command == "set-targets":
         cmd_set_targets(args)
     elif args.command == "benchmark":
-        cmd_benchmark(args)
+        if args.fidelity is not None:
+            cmd_benchmark_fidelity(args)
+        else:
+            cmd_benchmark(args)
 
 
 if __name__ == "__main__":
