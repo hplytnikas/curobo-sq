@@ -200,6 +200,9 @@ nvidia_curobo*/
 *tfevents*
 
 *.csv
+# but DO track the benchmark results so runs are versioned
+!curobov2/curobo/curobo/examples/paper/eval_out/results.csv
+!curobov2/curobo/curobo/examples/paper/eval_out/targets.json
 docs/*
 
 # Builds
@@ -452,7 +455,6 @@ random*
 *.o
 superdec/fast_sampler/_sampler.cpp
 render*
-*.mp4
 build*
 tmp*
 *.pt
@@ -467,3 +469,8 @@ checkpoints*
 !finetuning/data_samples/**/*.npz
 
 cuda_12.8.0_570.86.10_linux.run
+
+scenes_cache.pkl
+
+# Downloaded paper assets (ShapeNet_test, tabletop_finetuned, chair.ply, scenes_cache.pkl)
+/data/paper/

@@ -1,0 +1,6 @@
+geometry_msgs/PoseStamped target_pose
+superquadric_interfaces/Superquadric[] obstacles
+---
+bool success
+string message
+---

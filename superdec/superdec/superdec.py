@@ -10,6 +10,7 @@ from superdec.lm_optimization.lm_optimizer import LMOptimizer
 class SuperDec(nn.Module):
     def __init__(self, ctx):
         super(SuperDec, self).__init__()
+        self.rotation6d = bool(getattr(ctx, "rotation6d", False))
         self.n_layers = ctx.decoder.n_layers
         self.n_heads = ctx.decoder.n_heads
         self.n_queries = ctx.decoder.n_queries
@@ -34,7 +35,7 @@ class SuperDec(nn.Module):
             nn.ReLU(),
             nn.Linear(self.emb_dims, self.emb_dims),
         )
-        self.heads = SuperDecHead(emb_dims=self.emb_dims)
+        self.heads = SuperDecHead(emb_dims=self.emb_dims, rotation6d=self.rotation6d)
         init_queries = torch.zeros(self.n_queries + 1, self.emb_dims)
         self.register_buffer('init_queries', init_queries) # TODO double check -> new codebase
     

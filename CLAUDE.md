@@ -8,23 +8,21 @@ This project integrates **superquadric obstacle representations** into [CuRobo](
 
 1. **SuperDec** (`superdec/`): Neural network (transformer encoder-decoder) that decomposes 3D point clouds into superquadric primitives
 2. **CuRobo** (`curobo/`): Fork with native superquadric SDF/collision kernels added
-3. **OpenGJK** (`openGJK/`): Standalone GJK collision library — **not used in the planning pipeline**; kept for independent geometry validation only
 
 ## Python Environment
 
-All Python commands must use the Isaac Sim interpreter with CUDA 12.8 in `PATH`:
+All Python commands use the `3dv` conda environment:
 ```bash
-PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH ~/isaacsim/python.sh <script.py>
+conda run -n 3dv python <script.py>
 ```
 
-There is also an `omni_python` alias that wraps this. The virtual env at `.venv/` is separate and used for SuperDec training/inference.
+The virtual env at `.venv/` is separate and used for SuperDec training/inference.
 
 ## Building CuRobo CUDA Extensions
 
 After modifying any `.cu` or `.cpp` file in `curobo/src/curobolib/cpp/`:
 ```bash
-PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH ~/isaacsim/python.sh \
-  -m pip install -e curobo/ --no-build-isolation
+conda run -n 3dv python -m pip install -e curobo/ --no-build-isolation
 ```
 GPU architecture target: **8.9** (RTX 4090 / Ada). NVCC flags include `-O3 --ftz=true --fmad=true`.
 
@@ -32,10 +30,10 @@ GPU architecture target: **8.9** (RTX 4090 / Ada). NVCC flags include `-O3 --ftz
 
 ```bash
 # Superquadric rotation/quaternion regression test (most relevant)
-PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH ~/isaacsim/python.sh tests/test_sq_rotation.py
+conda run -n 3dv python tests/test_sq_rotation.py
 
 # Main integration demo
-PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH ~/isaacsim/python.sh \
+conda run -n 3dv python \
   curobo/examples/isaac_sim/motion_gen_reacher_superquadrics.py \
   --world_representation superquadrics
 ```
@@ -62,14 +60,3 @@ PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH ~/isaacsim/python.sh \
 - **Decoder**: `TransformerDecoder` (n_queries=16 superquadrics, n_layers=3, n_heads=1)
 - **Head**: outputs per-SQ: radii (a,b,c), shape (eps1,eps2), position (x,y,z), quaternion
 - Training uses Hydra config at `superdec/configs/train.yaml`
-
-## Building OpenGJK (standalone geometry validation only)
-
-OpenGJK is **not part of the planning pipeline**. Build it only if you need to
-cross-validate SQ geometry against an independent collision library.
-```bash
-cmake -B openGJK/build -DCMAKE_BUILD_TYPE=Release -DBUILD_GPU=ON \
-  -S openGJK -DCMAKE_CUDA_ARCHITECTURES=89
-cmake --build openGJK/build
-ctest --test-dir openGJK/build
-```

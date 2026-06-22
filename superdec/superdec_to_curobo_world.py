@@ -15,7 +15,7 @@ def superdec_to_curobo_world(
     ply_path: str,
     checkpoint_folder: str = "checkpoints/normalized",
     output_dir: str = "/tmp/superdec_meshes",
-    resolution: int = 30,
+    resolution: int = 96,
 ) -> WorldConfig:
 
     os.makedirs(output_dir, exist_ok=True)

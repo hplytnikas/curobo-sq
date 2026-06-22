@@ -749,7 +749,7 @@ void sphere_sq_sum_cost_and_grad_kernel(
 
 namespace {
 
-static int clamp_env(int e, int maxe)
+__host__ __device__ __forceinline__ static int clamp_env(int e, int maxe)
 {
     return std::max(0, std::min(e, maxe - 1));
 }
@@ -1117,6 +1117,573 @@ torch::Tensor evaluate_all_sq_grad(
 
 } // anonymous namespace
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Batch environment kernels
+ *
+ * These kernels eliminate per-environment loops by handling all environments
+ * in a single launch, matching the OBB kernel architecture for efficiency.
+ *
+ * Each thread block handles one sphere; accesses all environments for that
+ * sphere via env_query_idx[] lookups, accumulating costs across all packed SQ
+ * environments into a single output buffer.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Batch environment min-distance kernel (max-cost and ESDF paths) ─────── */
+template <bool COMPUTE_ESDF>
+__global__
+void sphere_sq_batch_env_min_kernel(
+    const float*  __restrict__ spheres,         // [batch, horizon, n_spheres, 4]
+    float*        __restrict__ out_dist,        // [batch, horizon, n_spheres]
+    const SQData* __restrict__ all_sq_packed,   // [num_envs * max_nobs]
+    const int*    __restrict__ sq_env_starts,   // [num_envs]   offsets into all_sq_packed
+    const int*    __restrict__ sq_env_counts,   // [num_envs]   valid SQ count per env
+    const int32_t*__restrict__ env_query_idx,   // [batch]      env index per batch entry
+    const float*  __restrict__ weight,
+    const float*  __restrict__ activation_distance,
+    const int     batch_size,
+    const int     horizon,
+    const int     n_spheres,
+    const int     num_envs)
+{
+    __shared__ SQData sh[SQ_TILE];
+
+    const int tid   = threadIdx.x;
+    const int gid   = blockIdx.x * BLOCK + tid;
+    const int total = batch_size * horizon * n_spheres;
+    
+    if (gid >= total) return;
+
+    /* Decompose global index into batch, horizon, sphere */
+    const int b_idx = gid / (horizon * n_spheres);
+    const int h_idx = (gid - b_idx * (horizon * n_spheres)) / n_spheres;
+    const int s_idx = gid - b_idx * horizon * n_spheres - h_idx * n_spheres;
+
+    /* Load sphere position and radius */
+    const float4 s = __ldg(reinterpret_cast<const float4*>(spheres) + gid);
+    const float px = s.x, py = s.y, pz = s.z, pr = s.w;
+    
+    if (pr < 0.f) {
+        out_dist[gid] = COMPUTE_ESDF ? -1e6f : 0.f;
+        return;
+    }
+
+    /* Determine environment for this batch entry */
+    const int env_idx = env_query_idx != nullptr ? env_query_idx[b_idx] : 0;
+    const int env_idx_clamped = clamp_env(env_idx, num_envs);
+    
+    const int sq_start = sq_env_starts[env_idx_clamped];
+    const int sq_count = sq_env_counts[env_idx_clamped];
+    
+    float min_dist = 1e10f;
+
+    /* Tile loop over all SQs in this environment */
+    for (int base = 0; base < sq_count; base += SQ_TILE) {
+        if (tid < SQ_TILE) {
+            const int load_i = sq_start + base + tid;
+            if (load_i < sq_start + sq_count)
+                sh[tid] = all_sq_packed[load_i];
+        }
+        __syncthreads();
+
+        const int tile_end = min(SQ_TILE, sq_count - base);
+        for (int j = 0; j < tile_end; ++j) {
+            if (sh[j]._pad == 0.f) continue;
+            min_dist = fminf(min_dist, sq_sdf(px, py, pz, pr, sh[j]));
+        }
+        __syncthreads();
+    }
+
+    /* Convert to CuRobo convention (negate) */
+    const float sdf_curobo = -min_dist;
+    
+    const float ad = activation_distance != nullptr
+                     ? activation_distance[0] : 0.f;
+    const float wt = weight != nullptr ? weight[0] : 1.f;
+
+    float out_value;
+    if (COMPUTE_ESDF) {
+        out_value = sdf_curobo;
+    } else {
+        /* Calculate collision cost from SDF */
+        const float pos = fmaxf(sdf_curobo, 0.f);
+        float cost;
+        if (ad > 0.f) {
+            cost = (pos > ad) ? (pos - 0.5f * ad) : ((0.5f / ad) * pos * pos);
+        } else {
+            cost = pos;
+        }
+        out_value = cost * wt;
+    }
+    
+    out_dist[gid] = out_value;
+}
+
+/* ── Batch environment min-dist + gradient kernel ──────────────────────────
+ *
+ * Extends sphere_sq_batch_env_min_kernel to also compute and output the
+ * world-frame unit outward normal (gradient) for the closest obstacle.
+ * out_grad layout: float4 per sphere, xyz = world-frame normal, w = 0.
+ */
+__global__
+void sphere_sq_batch_env_min_and_grad_kernel(
+    const float*  __restrict__ spheres,         // [batch, horizon, n_spheres, 4]
+    float*        __restrict__ out_dist,        // [batch, horizon, n_spheres]
+    float4*       __restrict__ out_grad,        // [batch, horizon, n_spheres]
+    const SQData* __restrict__ all_sq_packed,   // [num_envs * max_nobs]
+    const int*    __restrict__ sq_env_starts,   // [num_envs]   offsets
+    const int*    __restrict__ sq_env_counts,   // [num_envs]   counts
+    const int32_t*__restrict__ env_query_idx,   // [batch]
+    const float*  __restrict__ weight,
+    const float*  __restrict__ activation_distance,
+    const int     batch_size,
+    const int     horizon,
+    const int     n_spheres,
+    const int     num_envs)
+{
+    /* s_max_sq: block-wide max sq_count so every thread iterates the same
+     * number of tile-loop steps and always reaches __syncthreads(). */
+    __shared__ SQData sh[SQ_TILE];
+    __shared__ int    s_max_sq;
+
+    const int tid   = threadIdx.x;
+    const int gid   = blockIdx.x * BLOCK + tid;
+    const int total = batch_size * horizon * n_spheres;
+
+    const bool in_bounds = (gid < total);
+    float px = 0.f, py = 0.f, pz = 0.f, pr = -1.f;
+    if (in_bounds) {
+        const float4 s_data = __ldg(reinterpret_cast<const float4*>(spheres) + gid);
+        px = s_data.x; py = s_data.y; pz = s_data.z; pr = s_data.w;
+    }
+    const bool active = in_bounds && (pr >= 0.f);
+
+    int sq_start = 0, sq_count = 0;
+    if (active) {
+        const int b_idx           = gid / (horizon * n_spheres);
+        const int env_idx         = env_query_idx != nullptr ? env_query_idx[b_idx] : 0;
+        const int env_idx_clamped = clamp_env(env_idx, num_envs);
+        sq_start = sq_env_starts[env_idx_clamped];
+        sq_count = sq_env_counts[env_idx_clamped];
+    }
+
+    /* Compute block-wide max sq_count so the tile loop runs uniformly. */
+    if (tid == 0) s_max_sq = 0;
+    __syncthreads();
+    if (active) atomicMax(&s_max_sq, sq_count);
+    __syncthreads();
+    const int max_sq = s_max_sq;
+
+    float min_dist = 1e10f;
+    float best_nx = 0.f, best_ny = 0.f, best_nz = 1.f;
+
+    /* Tile loop — all threads always reach both __syncthreads() calls. */
+    for (int base = 0; base < max_sq; base += SQ_TILE) {
+        /* Cooperative load: threads 0..SQ_TILE-1 fill the tile.
+         * Slots outside [sq_start, sq_start+sq_count) are marked disabled
+         * so the inner loop skips them via the _pad==0 check. */
+        if (tid < SQ_TILE) {
+            const int load_i = sq_start + base + tid;
+            if (active && load_i < sq_start + sq_count)
+                sh[tid] = all_sq_packed[load_i];
+            else
+                sh[tid]._pad = 0.f;
+        }
+        __syncthreads();
+
+        if (active) {
+            const int tile_end = min(SQ_TILE, sq_count - base);
+            for (int j = 0; j < tile_end; ++j) {
+                if (sh[j]._pad == 0.f) continue;
+                float wnx, wny, wnz;
+                const float d = sq_sdf_and_normal(px, py, pz, pr, sh[j],
+                                                  wnx, wny, wnz);
+                if (d < min_dist) {
+                    min_dist = d;
+                    best_nx = wnx;
+                    best_ny = wny;
+                    best_nz = wnz;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (!in_bounds) return;
+
+    if (!active) {
+        out_dist[gid] = 0.f;
+        out_grad[gid] = make_float4(0.f, 0.f, 1.f, 0.f);
+        return;
+    }
+
+    /* Convert to CuRobo convention and output (ESDF: raw distance, not weighted) */
+    out_dist[gid] = -min_dist;
+    out_grad[gid] = make_float4(-best_nx, -best_ny, -best_nz, 0.f);
+}
+
+/* ── Batch environment sum-cost kernel (accumulate cost over all SQs) ───── */
+__global__
+void sphere_sq_batch_env_sum_kernel(
+    const float*  __restrict__ spheres,         // [batch, horizon, n_spheres, 4]
+    float*        __restrict__ out_dist,        // [batch, horizon, n_spheres]
+    const SQData* __restrict__ all_sq_packed,   // [num_envs * max_nobs]
+    const int*    __restrict__ sq_env_starts,   // [num_envs]   offsets
+    const int*    __restrict__ sq_env_counts,   // [num_envs]   counts
+    const int32_t*__restrict__ env_query_idx,   // [batch]
+    const float*  __restrict__ weight,
+    const float*  __restrict__ activation_distance,
+    const int     batch_size,
+    const int     horizon,
+    const int     n_spheres,
+    const int     num_envs)
+{
+    __shared__ SQData sh[BLOCK];
+
+    const int tid     = threadIdx.x;
+    const int warp_id = tid / WARP_SZ;
+    const int lane    = tid & (WARP_SZ - 1);
+    const int gid     = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    const int total   = batch_size * horizon * n_spheres;
+    
+    if (gid >= total) return;
+
+    const int b_idx = gid / (horizon * n_spheres);
+    const int h_idx = (gid - b_idx * (horizon * n_spheres)) / n_spheres;
+    const int s_idx = gid - b_idx * horizon * n_spheres - h_idx * n_spheres;
+
+    const float4 s_data = __ldg(reinterpret_cast<const float4*>(spheres) + gid);
+    const float px = s_data.x, py = s_data.y, pz = s_data.z, pr = s_data.w;
+
+    if (pr < 0.f) {
+        out_dist[gid] = 0.f;
+        return;
+    }
+
+    const int env_idx = env_query_idx != nullptr ? env_query_idx[b_idx] : 0;
+    const int env_idx_clamped = clamp_env(env_idx, num_envs);
+    
+    const int sq_start = sq_env_starts[env_idx_clamped];
+    const int sq_count = sq_env_counts[env_idx_clamped];
+
+    float partial = 0.f;
+    const float ad = activation_distance != nullptr
+                     ? activation_distance[0] : 0.f;
+
+    /* Warp-level iteration over all SQs in this environment */
+    for (int base = 0; base < sq_count; base += BLOCK) {
+        const int load_i = base + tid;
+        if (load_i < sq_count)
+            sh[tid] = all_sq_packed[sq_start + load_i];
+        __syncthreads();
+
+        const int tile_end = min(BLOCK, sq_count - base);
+        for (int j = lane; j < tile_end; j += WARP_SZ) {
+            if (sh[j]._pad == 0.f) continue;
+            if (sq_aabb_miss(px, py, pz, pr, sh[j])) continue;
+            
+            const float sdf_curobo = -sq_sdf(px, py, pz, pr, sh[j]);
+            if (sdf_curobo > 0.f) {
+                if (ad > 0.f) {
+                    if (sdf_curobo > ad) {
+                        partial += sdf_curobo - 0.5f * ad;
+                    } else {
+                        partial += (0.5f / ad) * sdf_curobo * sdf_curobo;
+                    }
+                } else {
+                    partial += sdf_curobo;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    /* Warp reduction */
+    partial += __shfl_down_sync(0xffffffff, partial, 16);
+    partial += __shfl_down_sync(0xffffffff, partial,  8);
+    partial += __shfl_down_sync(0xffffffff, partial,  4);
+    partial += __shfl_down_sync(0xffffffff, partial,  2);
+    partial += __shfl_down_sync(0xffffffff, partial,  1);
+
+    if (lane == 0) {
+        const float wt = weight != nullptr ? weight[0] : 1.f;
+        out_dist[gid] = partial * wt;
+    }
+}
+
+/* ── Batch environment sum-cost + gradient kernel ────────────────────────────
+ *
+ * Warp-per-sphere design: WARPS_PER_BLOCK warps per block, one sphere per
+ * warp. All BLOCK threads cooperatively load BLOCK SQ descriptors per tile
+ * into shared memory, then each warp iterates over those descriptors with
+ * warp-stride access.
+ *
+ * Per-sphere gradient:
+ *   ∂cost/∂sphere_pos = -wt * Σ_i  cost'_i(sdf_i) * n̂_i
+ * where n̂_i is the world-frame unit outward normal from sq_sdf_and_normal.
+ *
+ * __syncthreads() safety: no thread may return before the tile loop.  We use
+ * an `active` flag and s_max_sq_count (block-wide max) so every thread in
+ * the block always reaches both __syncthreads() calls in the tile loop.
+ * Inactive threads zero their sh[tid]._pad so the _pad==0 guard catches them.
+ *
+ * Launch: grid = ceil(total / WARPS_PER_BLOCK), block = BLOCK.
+ */
+__global__
+void sphere_sq_batch_env_sum_and_grad_kernel(
+    const float*  __restrict__ spheres,
+    float*        __restrict__ out_dist,
+    float4*       __restrict__ out_grad,
+    const SQData* __restrict__ all_sq_packed,
+    const int*    __restrict__ sq_env_starts,
+    const int*    __restrict__ sq_env_counts,
+    const int32_t*__restrict__ env_query_idx,
+    const float*  __restrict__ weight,
+    const float*  __restrict__ activation_distance,
+    const int     batch_size,
+    const int     horizon,
+    const int     n_spheres,
+    const int     num_envs)
+{
+    __shared__ SQData sh[BLOCK];
+    __shared__ int    s_max_sq_count;  // block-wide max for aligned tile iterations
+
+    const int tid     = threadIdx.x;
+    const int warp_id = tid / WARP_SZ;
+    const int lane    = tid & (WARP_SZ - 1);
+    const int gid     = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    const int total   = batch_size * horizon * n_spheres;
+
+    const bool in_bounds = (gid < total);
+    float px = 0.f, py = 0.f, pz = 0.f, pr = -1.f;
+    if (in_bounds) {
+        const float4 s_data = __ldg(reinterpret_cast<const float4*>(spheres) + gid);
+        px = s_data.x; py = s_data.y; pz = s_data.z; pr = s_data.w;
+    }
+    const bool active = in_bounds && (pr >= 0.f);
+
+    int sq_start = 0, sq_count = 0;
+    if (active) {
+        const int b_idx           = gid / (horizon * n_spheres);
+        const int env_idx         = env_query_idx != nullptr ? env_query_idx[b_idx] : 0;
+        const int env_idx_clamped = clamp_env(env_idx, num_envs);
+        sq_start = sq_env_starts[env_idx_clamped];
+        sq_count = sq_env_counts[env_idx_clamped];
+    }
+
+    /* Compute block-wide max sq_count for uniform tile-loop iteration count. */
+    if (tid == 0) s_max_sq_count = 0;
+    __syncthreads();
+    if (active && lane == 0) atomicMax(&s_max_sq_count, sq_count);
+    __syncthreads();
+    const int max_sq_count = s_max_sq_count;
+
+    const float ad = activation_distance != nullptr ? activation_distance[0] : 0.f;
+
+    float partial = 0.f;
+    float sum_gnx = 0.f, sum_gny = 0.f, sum_gnz = 0.f;
+
+    /* Tile loop — every thread always reaches both __syncthreads() calls. */
+    for (int base = 0; base < max_sq_count; base += BLOCK) {
+        /* All BLOCK threads cooperatively fill sh[].
+         * Slots outside this warp's valid range are zeroed so _pad==0 skips them. */
+        const int load_i = base + tid;
+        if (active && load_i < sq_count)
+            sh[tid] = all_sq_packed[sq_start + load_i];
+        else
+            sh[tid]._pad = 0.f;
+        __syncthreads();
+
+        if (active) {
+            const int tile_end = min(BLOCK, sq_count - base);
+            for (int j = lane; j < tile_end; j += WARP_SZ) {
+                if (sh[j]._pad == 0.f) continue;
+                if (sq_aabb_miss(px, py, pz, pr, sh[j])) continue;
+                float wnx, wny, wnz;
+                const float sdf = -sq_sdf_and_normal(px, py, pz, pr, sh[j],
+                                                      wnx, wny, wnz);
+                if (sdf > 0.f) {
+                    float cost_d;
+                    if (ad > 0.f) {
+                        if (sdf > ad) {
+                            partial += sdf - 0.5f * ad;
+                            cost_d   = 1.f;
+                        } else {
+                            partial += (0.5f / ad) * sdf * sdf;
+                            cost_d   = sdf / ad;
+                        }
+                    } else {
+                        partial += sdf;
+                        cost_d   = 1.f;
+                    }
+                    /* Accumulate -cost'_i * n̂_i (negative: gradient points inward) */
+                    sum_gnx -= cost_d * wnx;
+                    sum_gny -= cost_d * wny;
+                    sum_gnz -= cost_d * wnz;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    /* Warp-level reduction — only active warps have non-zero accumulators. */
+    partial  += __shfl_down_sync(0xffffffff, partial,  16);
+    partial  += __shfl_down_sync(0xffffffff, partial,   8);
+    partial  += __shfl_down_sync(0xffffffff, partial,   4);
+    partial  += __shfl_down_sync(0xffffffff, partial,   2);
+    partial  += __shfl_down_sync(0xffffffff, partial,   1);
+    sum_gnx  += __shfl_down_sync(0xffffffff, sum_gnx,  16);
+    sum_gnx  += __shfl_down_sync(0xffffffff, sum_gnx,   8);
+    sum_gnx  += __shfl_down_sync(0xffffffff, sum_gnx,   4);
+    sum_gnx  += __shfl_down_sync(0xffffffff, sum_gnx,   2);
+    sum_gnx  += __shfl_down_sync(0xffffffff, sum_gnx,   1);
+    sum_gny  += __shfl_down_sync(0xffffffff, sum_gny,  16);
+    sum_gny  += __shfl_down_sync(0xffffffff, sum_gny,   8);
+    sum_gny  += __shfl_down_sync(0xffffffff, sum_gny,   4);
+    sum_gny  += __shfl_down_sync(0xffffffff, sum_gny,   2);
+    sum_gny  += __shfl_down_sync(0xffffffff, sum_gny,   1);
+    sum_gnz  += __shfl_down_sync(0xffffffff, sum_gnz,  16);
+    sum_gnz  += __shfl_down_sync(0xffffffff, sum_gnz,   8);
+    sum_gnz  += __shfl_down_sync(0xffffffff, sum_gnz,   4);
+    sum_gnz  += __shfl_down_sync(0xffffffff, sum_gnz,   2);
+    sum_gnz  += __shfl_down_sync(0xffffffff, sum_gnz,   1);
+
+    if (!in_bounds) return;
+
+    if (lane == 0) {
+        if (!active) {
+            out_dist[gid] = 0.f;
+            out_grad[gid] = make_float4(0.f, 0.f, 0.f, 0.f);
+        } else {
+            const float wt = weight != nullptr ? weight[0] : 1.f;
+            out_dist[gid] = partial * wt;
+            out_grad[gid] = make_float4(wt * sum_gnx, wt * sum_gny, wt * sum_gnz, 0.f);
+        }
+    }
+}
+
+/* ── Batch environment swept-sphere kernel (handles all sweep steps internally) ─ */
+__global__
+void sphere_sq_batch_env_swept_kernel(
+    const float*  __restrict__ sphere_pos,      // [batch, horizon, n_sph, 4]
+    const float*  __restrict__ next_sphere_pos, // [batch, horizon, n_sph, 3] displacement
+    float*        __restrict__ out_dist,        // [batch, horizon, n_spheres]
+    const SQData* __restrict__ all_sq_packed,   // [num_envs * max_nobs]
+    const int*    __restrict__ sq_env_starts,   // [num_envs]
+    const int*    __restrict__ sq_env_counts,   // [num_envs]
+    const int32_t*__restrict__ env_query_idx,   // [batch]
+    const float*  __restrict__ weight,
+    const float*  __restrict__ activation_distance,
+    const float*  __restrict__ speed_dt,        // [batch, horizon]
+    const int     batch_size,
+    const int     horizon,
+    const int     n_spheres,
+    const int     num_envs,
+    const int     sweep_steps,
+    const bool    enable_speed_metric)
+{
+    __shared__ SQData sh[SQ_TILE];
+    __shared__ float  speed_scales[BLOCK];
+    __shared__ int    s_max_sq;
+
+    const int tid   = threadIdx.x;
+    const int gid   = blockIdx.x * BLOCK + tid;
+    const int total = batch_size * horizon * n_spheres;
+
+    const bool in_bounds = (gid < total);
+    float px0 = 0.f, py0 = 0.f, pz0 = 0.f, pr = -1.f;
+    if (in_bounds) {
+        const float4 s_curr = __ldg(reinterpret_cast<const float4*>(sphere_pos) + gid);
+        px0 = s_curr.x; py0 = s_curr.y; pz0 = s_curr.z; pr = s_curr.w;
+    }
+    const bool active = in_bounds && (pr >= 0.f);
+
+    float dx = 0.f, dy = 0.f, dz = 0.f;
+    int b_idx = 0, h_idx = 0;
+    int sq_start = 0, sq_count = 0;
+    if (active) {
+        b_idx = gid / (horizon * n_spheres);
+        h_idx = (gid - b_idx * (horizon * n_spheres)) / n_spheres;
+
+        const int next_idx = (h_idx == horizon - 1) ? gid : gid + n_spheres;
+        const float4 s_next = __ldg(reinterpret_cast<const float4*>(next_sphere_pos) + next_idx);
+        dx = s_next.x - px0; dy = s_next.y - py0; dz = s_next.z - pz0;
+
+        float speed_scale = 1.f;
+        if (enable_speed_metric) {
+            const float step_len = sqrtf(dx * dx + dy * dy + dz * dz);
+            const float dt = (speed_dt != nullptr && h_idx < horizon)
+                            ? fmaxf(fabsf(speed_dt[b_idx * horizon + h_idx]), 1e-6f)
+                            : 1.f;
+            speed_scale = fminf(fmaxf(1.f + step_len / dt, 1.f), 50.f);
+        }
+        speed_scales[tid] = speed_scale;
+
+        const int env_idx         = env_query_idx != nullptr ? env_query_idx[b_idx] : 0;
+        const int env_idx_clamped = clamp_env(env_idx, num_envs);
+        sq_start = sq_env_starts[env_idx_clamped];
+        sq_count = sq_env_counts[env_idx_clamped];
+    } else {
+        speed_scales[tid] = 1.f;
+    }
+
+    /* Block-wide max sq_count for uniform tile-loop iteration. */
+    if (tid == 0) s_max_sq = 0;
+    __syncthreads();
+    if (active) atomicMax(&s_max_sq, sq_count);
+    __syncthreads();
+    const int max_sq = s_max_sq;
+
+    const float ad = activation_distance != nullptr ? activation_distance[0] : 0.f;
+    const float wt = weight != nullptr ? weight[0] : 1.f;
+    const int eff_steps = max(sweep_steps, 1);
+
+    float max_cost = 0.f;
+
+    for (int step = 0; step <= eff_steps; ++step) {
+        const float alpha = (float)step / (float)eff_steps;
+        const float px = px0 + alpha * dx;
+        const float py = py0 + alpha * dy;
+        const float pz = pz0 + alpha * dz;
+
+        float step_cost = 0.f;
+
+        for (int base = 0; base < max_sq; base += SQ_TILE) {
+            if (tid < SQ_TILE) {
+                const int load_i = sq_start + base + tid;
+                if (active && load_i < sq_start + sq_count)
+                    sh[tid] = all_sq_packed[load_i];
+                else
+                    sh[tid]._pad = 0.f;
+            }
+            __syncthreads();
+
+            if (active) {
+                const int tile_end = min(SQ_TILE, sq_count - base);
+                for (int j = 0; j < tile_end; ++j) {
+                    if (sh[j]._pad == 0.f) continue;
+                    const float sdf_curobo = -sq_sdf(px, py, pz, pr, sh[j]);
+                    const float pos = fmaxf(sdf_curobo, 0.f);
+                    float cost;
+                    if (ad > 0.f)
+                        cost = (pos > ad) ? (pos - 0.5f * ad) : ((0.5f / ad) * pos * pos);
+                    else
+                        cost = pos;
+                    step_cost = fmaxf(step_cost, cost);
+                }
+            }
+            __syncthreads();
+        }
+
+        if (active) {
+            step_cost = step_cost * speed_scales[tid];
+            max_cost = fmaxf(max_cost, step_cost);
+        }
+    }
+
+    if (!in_bounds) return;
+    out_dist[gid] = active ? max_cost * wt : 0.f;
+}
+
 /* ═════════════════════ Legacy ABI compatibility ═══════════════════════════
  *
  * geom_cuda.cpp still exports `superquadric_distance` and expects the legacy
@@ -1238,57 +1805,89 @@ sphere_superquadric_clpt(
                       ? activation_distance.flatten().select(0, 0).to(fo)
                       : torch::zeros({}, fo);
 
-    /* ── Per-query environment index ─────────────────────────────────── */
-    auto env_q = use_batch_env
-        ? env_query_idx.contiguous().to(sphere.device()).to(torch::kInt64).view({-1})
-        : torch::zeros({batch_size}, i64);
+    /* ── Per-query environment index (int32 for kernel) ──────────────── */
+    auto env_q_i32 = use_batch_env
+        ? env_query_idx.contiguous().to(sphere.device()).to(torch::kInt32).view({-1})
+        : torch::zeros({batch_size}, i32);
 
-    if (env_q.numel() == 0) {
-        env_q = torch::zeros({batch_size}, i64);
-    } else if (env_q.numel() < batch_size) {
-        auto pad = torch::zeros({batch_size}, i64);
-        pad.slice(0, 0, env_q.numel()).copy_(env_q);
-        env_q = pad;
-    } else if (env_q.numel() > batch_size) {
-        env_q = env_q.slice(0, 0, batch_size);
+    if (env_q_i32.numel() < batch_size) {
+        auto pad = torch::zeros({batch_size}, i32);
+        pad.slice(0, 0, env_q_i32.numel()).copy_(env_q_i32);
+        env_q_i32 = pad;
+    } else if (env_q_i32.numel() > batch_size) {
+        env_q_i32 = env_q_i32.slice(0, 0, batch_size);
     }
 
-    /* Broadcast batch-level env index to all (batch*horizon*n_spheres) queries */
-    const auto qids  = torch::arange(T, i64);
-    const auto bids  = torch::floor_divide(qids, (int64_t)horizon * n_spheres);
-    auto q_env = env_q.index_select(0, bids);
-    q_env = torch::clamp(q_env, (int64_t)0, (int64_t)(num_envs - 1));
-
-    /* ── Enabled obstacle mask [nenv, max_nobs] ──────────────────────── */
+    /* ── Enabled obstacle mask and pre-pack all environments ─────────── */
     const auto obs_range    = torch::arange(max_nobs, i32).view({1, max_nobs});
     const auto env_cnt_mask = (obs_range < n_sq_i32.view({-1, 1}));
     const auto en_mask      = sq_en.to(torch::kBool) & env_cnt_mask;
 
+    /* Pre-compute SQ counts per environment */
+    const auto sq_counts_per_env = torch::sum(en_mask.to(torch::kInt32), 1);
+
+    /* Create packed buffer with all environments' SQs and offsets */
+    std::vector<int> env_starts(num_envs);
+    int offset = 0;
+    for (int e = 0; e < num_envs; ++e) {
+        env_starts[e] = offset;
+        offset += max_nobs;  // Each environment gets max_nobs slots (disabled ones have _pad=0)
+    }
+
+    auto all_sq_packed = torch::empty({num_envs * max_nobs, 16}, fo);
+    for (int e = 0; e < num_envs; ++e) {
+        const auto sq_packed = pack_env_sq(sq_p, en_mask, e);
+        all_sq_packed.slice(0, env_starts[e], env_starts[e] + max_nobs)
+                     .copy_(sq_packed);
+    }
+
+    auto env_starts_tensor = torch::tensor(env_starts, 
+                                            torch::TensorOptions().dtype(torch::kInt32).device(sphere.device()));
+    auto sq_counts_tensor  = sq_counts_per_env.to(sphere.device()).to(torch::kInt32);
+
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    /* ── Per-environment evaluation ──────────────────────────────────── */
-    for (int e = 0; e < num_envs; ++e) {
-        const auto ev = evaluate_all_sq(
-            sph_flat, sq_p, en_mask, q_env, e,
-            wt_s, ad_s, sum_collisions, compute_esdf, stream);
+    /* ── Kernel launch ─────────────────────────────────────────────────
+     *
+     * Two distinct launch shapes:
+     *  - sum (warp-per-sphere): WARPS_PER_BLOCK spheres per block of BLOCK threads.
+     *    Grid = ceil(total / WARPS_PER_BLOCK).
+     *  - min (one-thread-per-sphere): BLOCK spheres per block of BLOCK threads.
+     *    Grid = ceil(total / BLOCK).
+     */
+    const int total_threads = batch_size * horizon * n_spheres;
 
-        if (compute_esdf)
-            dist_flat = torch::where(q_env == (int64_t)e, ev, dist_flat);
-        else
-            dist_flat = dist_flat + ev;
-
-        /* ── Analytical gradient: n̂ = ∇F/‖∇F‖ rotated to world frame ──
-         *
-         * Replaces the previous 6-launch numerical FD path.
-         * evaluate_all_sq_grad returns ∂cost/∂p with the env mask applied.
-         */
-        if (sphere_position.requires_grad()) {
-            const auto eg = evaluate_all_sq_grad(
-                sph_flat, sq_p, en_mask, q_env, e,
-                wt_s, ad_s, sum_collisions, compute_esdf, stream);
-            grad_flat = grad_flat + eg;
-        }
+    if (sum_collisions && !compute_esdf) {
+        /* Sum-collisions path: warp-per-sphere, computes cost AND gradient */
+        const int sum_blocks = (total_threads + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        sphere_sq_batch_env_sum_and_grad_kernel<<<sum_blocks, BLOCK, 0, stream>>>(
+            sph_flat.data_ptr<float>(),
+            dist_flat.data_ptr<float>(),
+            reinterpret_cast<float4*>(grad_flat.data_ptr<float>()),
+            reinterpret_cast<const SQData*>(all_sq_packed.data_ptr<float>()),
+            env_starts_tensor.data_ptr<int>(),
+            sq_counts_tensor.data_ptr<int>(),
+            env_q_i32.data_ptr<int32_t>(),
+            wt_s.numel() > 0 ? wt_s.data_ptr<float>() : nullptr,
+            ad_s.numel() > 0 ? ad_s.data_ptr<float>() : nullptr,
+            batch_size, horizon, n_spheres, num_envs);
+    } else {
+        /* Min-distance path (ESDF / max-cost): one thread per sphere */
+        const int min_blocks = (total_threads + BLOCK - 1) / BLOCK;
+        sphere_sq_batch_env_min_and_grad_kernel<<<min_blocks, BLOCK, 0, stream>>>(
+            sph_flat.data_ptr<float>(),
+            dist_flat.data_ptr<float>(),
+            reinterpret_cast<float4*>(grad_flat.data_ptr<float>()),
+            reinterpret_cast<const SQData*>(all_sq_packed.data_ptr<float>()),
+            env_starts_tensor.data_ptr<int>(),
+            sq_counts_tensor.data_ptr<int>(),
+            env_q_i32.data_ptr<int32_t>(),
+            wt_s.numel() > 0 ? wt_s.data_ptr<float>() : nullptr,
+            ad_s.numel() > 0 ? ad_s.data_ptr<float>() : nullptr,
+            batch_size, horizon, n_spheres, num_envs);
     }
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     spar_flat = (dist_flat > 0.f).to(torch::kUInt8);
 
@@ -1328,11 +1927,17 @@ swept_sphere_superquadric_clpt(
     const bool sum_collisions)
 {
     (void)compute_distance;
+    (void)sum_collisions;  // Swept always uses max aggregation
 
+    /* ── Type / contiguity normalisation ─────────────────────────────── */
     const auto sphere   = sphere_position.contiguous().to(torch::kFloat);
     const auto sq_p     = sq_params.contiguous().to(torch::kFloat);
     const auto sq_en    = sq_enable.contiguous().to(torch::kUInt8);
     const auto n_sq_i32 = n_env_sq.contiguous().to(torch::kInt32);
+    const auto speed    = speed_dt.numel() > 0 
+                         ? speed_dt.contiguous().to(torch::kFloat).view({-1})
+                         : torch::ones({batch_size * horizon}, torch::TensorOptions()
+                             .dtype(torch::kFloat).device(sphere.device()));
 
     const int   num_envs = std::max((int)sq_p.size(0), 1);
     const int64_t T      = (int64_t)batch_size * horizon * n_spheres;
@@ -1340,64 +1945,141 @@ swept_sphere_superquadric_clpt(
     const auto fo  = torch::TensorOptions().dtype(torch::kFloat).device(sphere.device());
     const auto u8  = torch::TensorOptions().dtype(torch::kUInt8) .device(sphere.device());
     const auto i32 = torch::TensorOptions().dtype(torch::kInt32) .device(sphere.device());
-    const auto i64 = torch::TensorOptions().dtype(torch::kInt64) .device(sphere.device());
 
     auto dist_flat = torch::zeros({T}, fo);
     auto grad_flat = torch::zeros({T, 4}, fo);
     auto spar_flat = torch::zeros({T}, u8);
+    const auto sph_flat = sphere.view({T, 4}).contiguous();
 
-    auto env_q = use_batch_env
-        ? env_query_idx.contiguous().to(sphere.device()).to(torch::kInt64).view({-1})
-        : torch::zeros({batch_size}, i64);
+    /* Scalar weight and activation distance */
+    const auto wt_s = weight.numel() > 0
+                      ? weight.flatten().select(0, 0).to(fo)
+                      : torch::ones({}, fo);
+    const auto ad_s = activation_distance.numel() > 0
+                      ? activation_distance.flatten().select(0, 0).to(fo)
+                      : torch::zeros({}, fo);
 
-    if (env_q.numel() == 0) {
-        env_q = torch::zeros({batch_size}, i64);
-    } else if (env_q.numel() < batch_size) {
-        auto pad = torch::zeros({batch_size}, i64);
-        pad.slice(0, 0, env_q.numel()).copy_(env_q);
-        env_q = pad;
-    } else if (env_q.numel() > batch_size) {
-        env_q = env_q.slice(0, 0, batch_size);
+    /* ── Per-query environment index (int32 for kernel) ──────────────── */
+    auto env_q_i32 = use_batch_env
+        ? env_query_idx.contiguous().to(sphere.device()).to(torch::kInt32).view({-1})
+        : torch::zeros({batch_size}, i32);
+
+    if (env_q_i32.numel() < batch_size) {
+        auto pad = torch::zeros({batch_size}, i32);
+        pad.slice(0, 0, env_q_i32.numel()).copy_(env_q_i32);
+        env_q_i32 = pad;
+    } else if (env_q_i32.numel() > batch_size) {
+        env_q_i32 = env_q_i32.slice(0, 0, batch_size);
     }
 
-    const auto qids = torch::arange(T, i64);
-    const auto bids = torch::floor_divide(qids, (int64_t)horizon * n_spheres);
-    auto q_env      = env_q.index_select(0, bids);
-    q_env = torch::clamp(q_env, (int64_t)0, (int64_t)(num_envs - 1));
-
+    /* ── Enabled obstacle mask and pre-pack all environments ─────────── */
     const auto obs_range    = torch::arange(max_nobs, i32).view({1, max_nobs});
     const auto env_cnt_mask = (obs_range < n_sq_i32.view({-1, 1}));
     const auto en_mask      = sq_en.to(torch::kBool) & env_cnt_mask;
 
+    /* Pre-compute SQ counts per environment */
+    const auto sq_counts_per_env = torch::sum(en_mask.to(torch::kInt32), 1);
+
+    /* Create packed buffer with all environments' SQs */
+    std::vector<int> env_starts(num_envs);
+    int offset = 0;
+    for (int e = 0; e < num_envs; ++e) {
+        env_starts[e] = offset;
+        offset += max_nobs;
+    }
+
+    auto all_sq_packed = torch::empty({num_envs * max_nobs, 16}, fo);
+    for (int e = 0; e < num_envs; ++e) {
+        const auto sq_packed = pack_env_sq(sq_p, en_mask, e);
+        all_sq_packed.slice(0, env_starts[e], env_starts[e] + max_nobs)
+                     .copy_(sq_packed);
+    }
+
+    auto env_starts_tensor = torch::tensor(env_starts, 
+                                            torch::TensorOptions().dtype(torch::kInt32).device(sphere.device()));
+    auto sq_counts_tensor  = sq_counts_per_env.to(sphere.device()).to(torch::kInt32);
+
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    dist_flat = evaluate_swept_sq(
-        sphere, sq_p, en_mask, q_env,
-        weight, activation_distance, speed_dt,
-        sweep_steps, enable_speed_metric,
-        sum_collisions, false, stream);
+    /* ── Compute next-position displacements ────────────────────────── */
+    const auto sph_view  = sphere.view({batch_size, horizon, n_spheres, 4});
+    const auto curr_pos  = sph_view.slice(3, 0, 3).contiguous();
+    const auto curr_rad  = sph_view.select(3, 3).contiguous();
+    
+    /* Next positions: shift by 1 along horizon; last step repeats final */
+    const auto next_pos = torch::cat({
+        curr_pos.slice(1, 1, horizon),
+        curr_pos.slice(1, horizon - 1, horizon)
+    }, 1).contiguous();
 
+    const auto disp = (next_pos - curr_pos).contiguous();
+
+    /* ── Single batch-environment swept kernel launch ──────────────── */
+    const int total_threads = batch_size * horizon * n_spheres;
+    int threadsPerBlock = total_threads;
+    if (threadsPerBlock > 128) threadsPerBlock = 128;
+    int blocksPerGrid = (total_threads + threadsPerBlock - 1) / threadsPerBlock;
+
+    sphere_sq_batch_env_swept_kernel<<<blocksPerGrid, threadsPerBlock, 0, stream>>>(
+        sph_flat.data_ptr<float>(),
+        disp.view({-1, 3}).data_ptr<float>(),
+        dist_flat.data_ptr<float>(),
+        reinterpret_cast<const SQData*>(all_sq_packed.data_ptr<float>()),
+        env_starts_tensor.data_ptr<int>(),
+        sq_counts_tensor.data_ptr<int>(),
+        env_q_i32.data_ptr<int32_t>(),
+        wt_s.numel() > 0 ? wt_s.data_ptr<float>() : nullptr,
+        ad_s.numel() > 0 ? ad_s.data_ptr<float>() : nullptr,
+        speed.numel() > 0 ? speed.data_ptr<float>() : nullptr,
+        batch_size, horizon, n_spheres, num_envs, sweep_steps, enable_speed_metric);
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    /* ── Gradient computation (numerical FD for swept sphere) ──────── */
     if (sphere_position.requires_grad()) {
         constexpr float eps = 1e-3f;
         for (int ax = 0; ax < 3; ++ax) {
-            auto qp = sphere.clone(); qp.select(3, ax).add_(eps);
-            auto qm = sphere.clone(); qm.select(3, ax).sub_(eps);
+            auto qp = sph_flat.clone(); 
+            qp.slice(1, ax * total_threads / 4, (ax + 1) * total_threads / 4).add_(eps);
+            auto qm = sph_flat.clone(); 
+            qm.slice(1, ax * total_threads / 4, (ax + 1) * total_threads / 4).sub_(eps);
 
-            const auto vp = evaluate_swept_sq(
-                qp, sq_p, en_mask, q_env,
-                weight, activation_distance, speed_dt,
-                sweep_steps, enable_speed_metric,
-                sum_collisions, false, stream);
-            const auto vm = evaluate_swept_sq(
-                qm, sq_p, en_mask, q_env,
-                weight, activation_distance, speed_dt,
-                sweep_steps, enable_speed_metric,
-                sum_collisions, false, stream);
+            auto dist_p = torch::zeros({T}, fo);
+            auto dist_m = torch::zeros({T}, fo);
 
-            grad_flat.select(1, ax).copy_((vp - vm) * (0.5f / eps));
+            /* Launch kernels for +eps and -eps perturbations */
+            sphere_sq_batch_env_swept_kernel<<<blocksPerGrid, threadsPerBlock, 0, stream>>>(
+                qp.data_ptr<float>(),
+                disp.view({-1, 3}).data_ptr<float>(),
+                dist_p.data_ptr<float>(),
+                reinterpret_cast<const SQData*>(all_sq_packed.data_ptr<float>()),
+                env_starts_tensor.data_ptr<int>(),
+                sq_counts_tensor.data_ptr<int>(),
+                env_q_i32.data_ptr<int32_t>(),
+                wt_s.numel() > 0 ? wt_s.data_ptr<float>() : nullptr,
+                ad_s.numel() > 0 ? ad_s.data_ptr<float>() : nullptr,
+                speed.numel() > 0 ? speed.data_ptr<float>() : nullptr,
+                batch_size, horizon, n_spheres, num_envs, sweep_steps, enable_speed_metric);
+
+            sphere_sq_batch_env_swept_kernel<<<blocksPerGrid, threadsPerBlock, 0, stream>>>(
+                qm.data_ptr<float>(),
+                disp.view({-1, 3}).data_ptr<float>(),
+                dist_m.data_ptr<float>(),
+                reinterpret_cast<const SQData*>(all_sq_packed.data_ptr<float>()),
+                env_starts_tensor.data_ptr<int>(),
+                sq_counts_tensor.data_ptr<int>(),
+                env_q_i32.data_ptr<int32_t>(),
+                wt_s.numel() > 0 ? wt_s.data_ptr<float>() : nullptr,
+                ad_s.numel() > 0 ? ad_s.data_ptr<float>() : nullptr,
+                speed.numel() > 0 ? speed.data_ptr<float>() : nullptr,
+                batch_size, horizon, n_spheres, num_envs, sweep_steps, enable_speed_metric);
+
+            grad_flat.select(1, ax).copy_((dist_p - dist_m) * (0.5f / eps));
         }
         grad_flat.select(1, 3).zero_();
     }
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     spar_flat = (dist_flat > 0.f).to(torch::kUInt8);
 

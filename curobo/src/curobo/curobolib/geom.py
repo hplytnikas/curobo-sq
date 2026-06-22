@@ -726,6 +726,12 @@ class SdfSphereSuperquadric(torch.autograd.Function):
             )
 
         try:
+            # Ensure integer tensors match the CUDA extension's expected int32 dtype
+            if isinstance(n_env_sq, torch.Tensor):
+                n_env_sq = n_env_sq.to(device=query_sphere.device, dtype=torch.int32)
+            if env_query_idx is not None and isinstance(env_query_idx, torch.Tensor):
+                env_query_idx = env_query_idx.to(device=query_sphere.device, dtype=torch.int32)
+
             r = geom_cu.closest_point_superquadric(
                 query_sphere,
                 out_buffer,
