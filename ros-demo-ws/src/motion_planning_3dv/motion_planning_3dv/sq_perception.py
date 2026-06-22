@@ -43,7 +43,7 @@ def ros_depth_to_numpy(msg: Image) -> np.ndarray:
     """
     Converts a ROS 2 Image message to a numpy array without cv_bridge.
     """
-    # 1. Determine dtype based on encoding
+    # Determine dtype based on encoding
     # '16UC1' is 16-bit unsigned integer (2 bytes per pixel)
     # '32FC1' is 32-bit float (4 bytes per pixel)
     if msg.encoding == '16UC1':
@@ -53,18 +53,12 @@ def ros_depth_to_numpy(msg: Image) -> np.ndarray:
     else:
         raise ValueError(f"Unsupported encoding: {msg.encoding}")
 
-    # 2. Create numpy array from the raw data buffer
-    # The buffer() call gives us access to the underlying memory of the message
+    # Create numpy array from the raw data buffer
     depth_array = np.frombuffer(msg.data, dtype=dtype)
-
-    # 3. Reshape into the correct dimensions
     depth_array = depth_array.reshape((msg.height, msg.width))
 
-    # 4. Handle row padding (stride) if present
-    # Standard ROS images have step = width * itemsize
-    # If msg.step is larger, there is padding at the end of every row
+    # Handle row padding (stride)
     if msg.step != msg.width * np.dtype(dtype).itemsize:
-        # If there is stride/padding, we must manually slice the array
         itemsize = np.dtype(dtype).itemsize
         depth_array = np.array([
             depth_array[i, :msg.width]
@@ -78,17 +72,17 @@ def numpy_to_pointcloud2(points: np.ndarray, frame_id: str, stamp=None) -> Point
     points: (N, 3) numpy array of floats
     frame_id: string
     """
-    # 1. Ensure the array is float32
+
     points = points.astype(np.float32)
 
-    # 2. Define the fields (x, y, z)
+    # Define fields
     fields = [
         PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
         PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
         PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
     ]
 
-    # 3. Create the message
+    # Create message
     msg = PointCloud2()
     msg.header.frame_id = frame_id
     if stamp:
@@ -101,30 +95,20 @@ def numpy_to_pointcloud2(points: np.ndarray, frame_id: str, stamp=None) -> Point
     msg.point_step = 12  # 3 fields * 4 bytes
     msg.row_step = msg.point_step * msg.width
     msg.is_dense = True
-
-    # 4. Copy the raw bytes
-    # .tobytes() creates a flat byte-buffer exactly how ROS expects it
     msg.data = points.tobytes()
 
     return msg
 
 def numpys_to_pointcloud2(segments: list, frame_id: str, stamp=None) -> PointCloud2:
-    """
-    segments: List of (N, 3) numpy arrays.
-    Returns: A single PointCloud2 message where the 'intensity' field
-             is used to store the segment index.
-    """
-    # 1. Prepare structured data
-    # We need: x, y, z (float32) and intensity/label (float32)
-    # Total points = sum of all segments
+    """convert list of (N, 3) numpy arrays to a single pointcloud, where intensity indicates which array the point stems for."""
+    # compute pointcloud size
     total_points = sum(s.shape[0] for s in segments)
 
-    # Create an empty structured array
     data = np.zeros(total_points, dtype=[
         ('x', 'f4'), ('y', 'f4'), ('z', 'f4'), ('intensity', 'f4')
     ])
 
-    # 2. Fill the data
+    # populate array
     current_idx = 0
     for i, seg in enumerate(segments):
         n = seg.shape[0]
@@ -135,7 +119,8 @@ def numpys_to_pointcloud2(segments: list, frame_id: str, stamp=None) -> PointClo
         data['intensity'][current_idx:current_idx+n] = float(i)
         current_idx += n
 
-    # 3. Define PointCloud2 fields
+
+    # assemble message
     fields = [
         PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
         PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
@@ -143,7 +128,6 @@ def numpys_to_pointcloud2(segments: list, frame_id: str, stamp=None) -> PointClo
         PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
     ]
 
-    # 4. Assemble the message
     msg = PointCloud2()
     msg.header.frame_id = frame_id
     if stamp:
@@ -167,18 +151,14 @@ def transform_to_matrix(transform: TransformStamped) -> np.ndarray:
     t = transform.transform.translation
     q = transform.transform.rotation
 
-    # Quaternion components
     x, y, z, w = q.x, q.y, q.z, q.w
 
-    # 1. Build the 3x3 rotation matrix from quaternion
-    # Standard formula for normalized quaternions
     rot_matrix = np.array([
         [1 - 2*y**2 - 2*z**2, 2*x*y - 2*z*w,     2*x*z + 2*y*w],
         [2*x*y + 2*z*w,     1 - 2*x**2 - 2*z**2, 2*y*z - 2*x*w],
         [2*x*z - 2*y*w,     2*y*z + 2*x*w,     1 - 2*x**2 - 2*y**2]
     ])
 
-    # 2. Build the 4x4 transformation matrix
     matrix = np.eye(4)
     matrix[:3, :3] = rot_matrix
     matrix[:3, 3] = [t.x, t.y, t.z]
@@ -186,9 +166,7 @@ def transform_to_matrix(transform: TransformStamped) -> np.ndarray:
     return matrix
 
 def transform_numpy(points: np.ndarray, transform: TransformStamped) -> np.ndarray:
-    """
-    Direct Transform: Uses the matrix helper to transform an (N, 3) numpy array.
-    """
+    """transform an (N, 3) numpy array/pointcloud."""
     # 1. Get the transformation matrix from the helper
     matrix = transform_to_matrix(transform)
 
@@ -234,6 +212,8 @@ def matrix_to_quat(R: np.ndarray) -> np.ndarray:
 
     return np.array([x, y, z, w])
 
+# helpers from the pipeline package
+
 def _normalize_points(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
     translation = points.mean(axis=0)
     centered = points - translation
@@ -273,21 +253,20 @@ class SuperquadricFitterNode(Node):
     def __init__(self):
         super().__init__('superquadric_fitter_node')
 
-        # 1. Parameter Declarations
         self.declare_parameter('target_frame', 'world')
         self.declare_parameter('use_lidar', False)
-        self.declare_parameter('timer_period_seconds', 0.1) # 10Hz estimation loop
+        self.declare_parameter('timer_period_seconds', 0.1)
 
         self.target_frame = self.get_parameter('target_frame').get_parameter_value().string_value
         self.use_lidar = self.get_parameter('use_lidar').get_parameter_value().bool_value
         timer_period = self.get_parameter('timer_period_seconds').get_parameter_value().double_value
 
-        # Best-effort QoS profile is standard for high-bandwidth sensor streams (LiDAR/Camera)
         sensor_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             depth=10
         )
 
+        # configure perception pipeline
         checkpoint_folder = "/home/vision/Downloads/concave_checkpoint/"
         self.fitter = SuperdecFitter("/home/vision/Downloads/superdec/", checkpoint_folder)
 
@@ -298,11 +277,11 @@ class SuperquadricFitterNode(Node):
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.eval()
 
-        # 2. Setup Subscriptions based on configuration
+        # ROS2 Interfaces
         if self.use_lidar:
             self.lidar_sub = self.create_subscription(
                 PointCloud2,
-                '/camera/depth/color/points',  # Common topic for RGBD pointclouds or generic LiDAR
+                '/camera/depth/color/points',
                 self.pointcloud_callback,
                 sensor_qos
             )
@@ -316,8 +295,6 @@ class SuperquadricFitterNode(Node):
             )
             self.get_logger().info("Superquadric node listening to Image stream.")
 
-        # 3. Setup Publishers
-        # Replace 'PointCloud2' with your actual 'SuperquadricArray' message type once written
         self.sq_publisher = self.create_publisher(
             SuperquadricArray,
             '/raw_superquadrics',
@@ -360,16 +337,14 @@ class SuperquadricFitterNode(Node):
             10
         )
 
-        # 4. Initialize TF2 Infrastructure
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # 5. Local internal data cache
+        self.processing_timer = self.create_timer(timer_period, self.process_and_fit)
+
+        # cache
         self.latest_sensor_data = None
         self.latest_header = None
-
-        # 6. Main Processing Loop Execution
-        self.processing_timer = self.create_timer(timer_period, self.process_and_fit)
 
     def pointcloud_callback(self, msg: PointCloud2):
         """Cache incoming pointclouds."""
@@ -384,7 +359,6 @@ class SuperquadricFitterNode(Node):
                       np.asarray([[525.0, 0.0, 319.5],
                                   [0.0, 525.0, 239.5],
                                   [0.0, 0.0, 1]]))
-        # Convert to float32 immediately for your pipeline, and force a copy
         self.latest_sensor_data = frame
 
     def process_and_fit(self):
@@ -395,36 +369,30 @@ class SuperquadricFitterNode(Node):
 
         source_frame = self.latest_header.frame_id
 
-        # A. Resolve Spatial Transform using TF2
+        # fetch transform
         try:
-            # Check transform viability relative to the incoming sensor's timestamp
             transform: TransformStamped = self.tf_buffer.lookup_transform(
                 target_frame=self.target_frame,
                 source_frame=source_frame,
-                time=rclpy.time.Time() # Alternately use self.latest_header.stamp for exact timing syncing
+                time=rclpy.time.Time()
             )
         except TransformException as ex:
             self.get_logger().warning(f"Could not transform {source_frame} to {self.target_frame}: {ex}")
             return
 
-        # B. Data Segmentation & Conversion
-        # TODO: If PointCloud2 -> convert to a structural array or Open3D/NumPy space
-        # TODO: If Image -> parse your bounding boxes / depth maps here
-
         self.get_logger().info(f"Processing frame data from {source_frame} in {self.target_frame} context...", throttle_duration_sec=2.0)
 
+        # compute pointcloud
         if isinstance(self.latest_sensor_data, Frame):
             self.latest_sensor_data.extrinsic = transform_to_matrix(transform)
             self.latest_sensor_data = get_world_pointcloud([self.latest_sensor_data], max_depth=1000000)
             print(self.latest_sensor_data)
             self.dbg_pc_publisher.publish(numpy_to_pointcloud2(np.asarray(self.latest_sensor_data.points), "world"))
 
-
-        # C. Geometric Superquadric Solver Pipeline
-        # E.g., Fit equation: ( (x/a1)**(2/e2) + (y/a2)**(2/e2) )**(e2/e1) + (z/a3)**(2/e1) = 1
+        # fit
         computed_superquadrics, scene = self.fit_superquadrics(self.latest_sensor_data, transform)
 
-        # D. Assemble and Ship Message
+        # publish
         if computed_superquadrics:
             output_msg = SuperquadricArray()
             output_msg.superquadrics = computed_superquadrics
@@ -435,16 +403,16 @@ class SuperquadricFitterNode(Node):
 
     def fit_superquadrics(self, data, transform):
         """
-        Placeholder function for your optimization math.
-        Here you would run Levenberg-Marquardt or an alternative gradient descent
-        solver to resolve shape scales (a1, a2, a3) and exponents (e1, e2).
+        run the later stages of the perception pipeline
         """
 
+        # removal
         obj_pts, table_normal, table_height, table_pts, _ = remove_table(np.asarray(data.points))
 
         self.dbg_obj_pc_publisher.publish(numpy_to_pointcloud2(obj_pts, "world"))
         self.dbg_tbl_pc_publisher.publish(numpy_to_pointcloud2(table_pts, "world"))
 
+        # segmentation
         instances = segment_instances_dual(obj_pts)
 
         self.dbg_inst_pc_publisher.publish(numpys_to_pointcloud2(instances, "world"))
@@ -456,6 +424,7 @@ class SuperquadricFitterNode(Node):
         for i, inst in enumerate(instances):
             scene_obj = SceneObject()
 
+            # fit
             sample_size = min(4096, len(inst))
             sample_idx = np.random.choice(len(inst), sample_size, replace=len(inst) < sample_size)
             points = inst[sample_idx]
@@ -490,6 +459,7 @@ class SuperquadricFitterNode(Node):
                     translation.tolist(), rotation, [0, 0, 0], [1, 0, 0, 0]
                 )
 
+                # populate base message
                 sq = Superquadric()
                 sq.header.frame_id = self.target_frame
                 sq.pose.position.x = float(translation[0] - scene_obj.pose.position.x)
@@ -509,6 +479,7 @@ class SuperquadricFitterNode(Node):
                 scene_obj.superquadrics.append(sq)
                 sq_list.append(sq)
 
+            # populate scene message
             scene.objects.append(scene_obj)
             scene_obj.id = i
             scene_obj.header.frame_id = 'world'

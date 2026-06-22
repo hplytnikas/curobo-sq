@@ -51,19 +51,17 @@ class SceneManager(Node):
     def __init__(self):
         super().__init__('scene_manager')
 
-        # --- State ---
-        # Dictionary mapping object ID to SceneObject
+        # node state
         self.scene_objects = {}
         self.update_requested = False
 
-        # --- Publishers ---
+        # ROS2 interfaces
         self.flattened_sq_pub = self.create_publisher(
             SuperquadricArray,
             '/scene_superquadrics',
             10
         )
 
-        # --- Subscribers ---
         self.scene_sub = self.create_subscription(
             Scene,
             '/scene',
@@ -71,7 +69,6 @@ class SceneManager(Node):
             10
         )
 
-        # --- Services ---
         self.srv_request_update = self.create_service(
             Trigger, '~/request_update', self.request_update_cb)
         self.srv_list_objects = self.create_service(
@@ -81,29 +78,23 @@ class SceneManager(Node):
         self.srv_delete_object = self.create_service(
             DeleteObject, '~/delete_object', self.delete_object_cb)
 
-        # --- Timers ---
-        # Publish the flattened superquadrics at 10 Hz
         self.publish_timer = self.create_timer(0.1, self.publish_flattened_scene)
 
         self.get_logger().info("Scene Manager initialized.")
 
-    # ==========================================
-    # Callbacks
-    # ==========================================
-
     def incoming_objects_callback(self, msg: Scene):
-        """Consumes incoming arrays ONLY if an update was requested."""
+        """Consumes incoming arrays if an update was requested."""
         if not self.update_requested:
             return
 
         self.scene_objects = {}
 
-        # Process the new objects (overwrite existing ones with the same ID)
+        # register objects
         for obj in msg.objects:
             self.scene_objects[obj.id] = obj, obj.pose
             self.get_logger().info(f"Consumed object {obj.id} from topic.")
 
-        # Reset the flag after fulfilling the request
+        # consume update request
         self.update_requested = False
         self.get_logger().info(f"Update consumed. Tracking {len(self.scene_objects)} objects total.")
 
@@ -138,17 +129,12 @@ class SceneManager(Node):
             self.get_logger().warn(f"Failed to delete object {request.id}: Not found.")
         return response
 
-    # ==========================================
-    # Timer Callbacks
-    # ==========================================
-
     def publish_flattened_scene(self):
         """Periodically flattens all superquadrics in the scene and publishes them."""
         out_msg = SuperquadricArray()
 
         flattened_list = []
         for obj, pose in self.scene_objects.values():
-            # Extend the flattened list with the superquadrics of this object
             for sq in obj.superquadrics:
                 from copy import deepcopy
                 from scipy.spatial.transform import Rotation as R
