@@ -39,7 +39,12 @@ REP_STYLE = {
 
 
 def plot_time_vs_primitives(df: pd.DataFrame, out: Path) -> None:
-    """One line per representation: mean planning time vs #primitives, std band."""
+    """One line per representation: mean planning time vs #primitives, std band.
+
+    Styled to match ``plot_benchmark_paper.plot_planning_time``: mean line with
+    a shaded ±std band (same marker, colors, alpha, grid and label layout); the
+    only difference is the x-axis is the raw number of collision primitives.
+    """
     ok = df[df["plan_success"] == 1]
     if ok.empty:
         ok = df  # nothing succeeded — fall back so the figure is still drawn
@@ -63,8 +68,8 @@ def plot_time_vs_primitives(df: pd.DataFrame, out: Path) -> None:
         ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.20)
 
     ax.set_xlabel("number of collision primitives")
-    ax.set_ylabel("planning time per target [s]")
-    ax.set_title("Planning time vs. scene complexity (mean ± std over targets)")
+    ax.set_ylabel("planning time\nper target [s]")
+    ax.set_title("Planning time (mean ± std over targets)")
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
