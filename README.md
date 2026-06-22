@@ -149,9 +149,9 @@ Regenerates every scene from the dataset and re-runs SuperDec inference:
 conda run -n 3dv python motion_planning_sq_demo.py
 
 # Benchmark, in order: build scenes → set 4 targets/scene → plan SQ vs mesh
-conda run -n 3dv python benchmark_sq_vs_mesh.py build          # → data/paper/scenes_cache.pkl
-conda run -n 3dv python benchmark_sq_vs_mesh.py set-targets    # → eval_out/targets.json
-conda run -n 3dv python benchmark_sq_vs_mesh.py benchmark      # → eval_out/results.csv
+conda run -n 3dv python benchmark_sq_vs_mesh.py build          # Builds random scenes → data/paper/scenes_cache.pkl
+conda run -n 3dv python benchmark_sq_vs_mesh.py set-targets    # GUI for setting targets → eval_out/targets.json
+conda run -n 3dv python benchmark_sq_vs_mesh.py benchmark      # Runs the benchmark for planning time → eval_out/results.csv
 
 # Sofa-scaling benchmark (needs data/paper/chair.ply)
 conda run -n 3dv python benchmark_sofa_scaling.py --counts 1,3,6,21,51
@@ -159,7 +159,7 @@ conda run -n 3dv python benchmark_sofa_scaling.py --counts 1,3,6,21,51
 
 Restrict object counts with `--counts 1,5,10`; the mesh-fidelity sweep is
 `benchmark_sq_vs_mesh.py benchmark --fidelity`. `targets.json` and `results.csv`
-are committed, so the figures can be regenerated without re-running anything.
+are in the repository, so the figures can be regenerated without re-running anything.
 
 ### 5. What each file in `paper/` does
 
