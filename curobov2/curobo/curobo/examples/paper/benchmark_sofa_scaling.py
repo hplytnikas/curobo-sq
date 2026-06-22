@@ -38,6 +38,7 @@ from scipy.spatial import cKDTree
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import motion_planning_sq_demo as demo  # noqa: E402
 import benchmark_sq_vs_mesh as bench  # noqa: E402
+import sofa_viz  # noqa: E402
 
 from curobo._src.geom.types import SceneCfg, Mesh  # noqa: E402
 from curobo._src.types.device_cfg import DeviceCfg  # noqa: E402
@@ -120,7 +121,7 @@ def _prepare_base_object(
     pts[:, 1] -= float(pts[:, 1].mean())
     pts[:, 2] -= float(pts[:, 2].min())
 
-    extent = float(max(pts[:, 0].ptp(), pts[:, 1].ptp()))
+    extent = float(max(np.ptp(pts[:, 0]), np.ptp(pts[:, 1])))
     print(f"Loaded object: {len(pts)} points, xy extent {extent:.2f} m")
 
     model = demo._load_model(checkpoint_folder, device)
@@ -191,12 +192,6 @@ def _build_scene_cfg(scene: dict, representation: str, table) -> Tuple[SceneCfg,
                 meshes.append(Mesh(name=f"obj_{p['iid']}_sq_{k}",
                                    vertices=v.tolist(), faces=f.tolist(),
                                    pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
-    elif representation == "pointcloud":
-        for p, pts in zip(scene["predictions"], scene["object_pts"]):
-            meshes.append(Mesh.from_pointcloud(
-                np.asarray(pts, dtype=np.float64), pitch=bench.PC_PITCH,
-                name=f"obj_{p['iid']}_pc",
-            ))
     else:
         raise ValueError(f"Unknown representation: {representation!r}")
 
@@ -270,7 +265,7 @@ def _run_scene(
                 JointState.from_position(last, joint_names=interp.joint_names)
             )
             if visualize is not None:
-                bench._animate(visualize, interp)
+                sofa_viz.animate(visualize, pos_per_step, interp.joint_names, bench.PLAYBACK_HZ)
         else:
             print(f"  [{representation}] {scene['name']} leg {leg + 1}: FAILED to plan")
 
@@ -322,14 +317,7 @@ def main() -> None:
 
     visualize = None
     if args.visualize:
-        from curobo.types import ContentPath
-        from curobo.viewer import ViserVisualizer
-        visualize = ViserVisualizer(
-            content_path=ContentPath(robot_config_file="franka.yml"),
-            connect_ip="0.0.0.0", connect_port=args.port,
-            add_control_frames=False, visualize_robot_spheres=False,
-        )
-        print(f"Viser running at http://localhost:{args.port}")
+        visualize = sofa_viz.make_visualizer(args.port)
 
     all_rows: List[dict] = []
     for n in counts:
@@ -339,8 +327,8 @@ def main() -> None:
         tree = cKDTree(all_pts)
         print(f"\n=== {scene['name']} ({n} instances, {len(all_pts)} points) ===")
         for rep in bench.REPRESENTATIONS:
-            if rep == "shapenet_mesh":
-                continue  # no original meshes for a raw point-cloud object
+            if rep in ("shapenet_mesh", "pointcloud"):
+                continue  # no original meshes; pointcloud primitives removed
             all_rows.extend(_run_scene(scene, table, rep, targets, device_cfg, tree, visualize))
 
     with open(RESULTS_SOFA_CSV, "w", newline="") as f:
