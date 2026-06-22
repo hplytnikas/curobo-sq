@@ -1,6 +1,6 @@
 # ROS Manipulation Demo
 
-This folder is a workspace for a small tabletop demonstration demo. There are a few quirks to the setup to get ROS packages working with python dependencies that conflict with ROS/system python. **Ensure that you have pulled the submodules in this repo.** The results of the demo are shown in ![](demo.mp4).
+This folder is a workspace for a small tabletop demonstration demo. There are a few quirks to the setup to get ROS packages working with python dependencies that conflict with ROS/system python. **Ensure that you have pulled the submodules in this repo.** The results of the demo are shown in ![this video](demo.mp4).
 
 
 ## Setup
