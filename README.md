@@ -64,8 +64,6 @@ conda run -n 3dv python \
   curobov2/curobo/curobo/examples/paper/motion_planning_sq_demo.py
 ```
 
-The standalone Isaac Sim examples under `getting_started/` are listed in
-[CuRobo - Changed Files](#curobo--changed-files).
 
 ---
 
