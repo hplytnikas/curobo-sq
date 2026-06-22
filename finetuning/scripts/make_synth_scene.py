@@ -18,7 +18,9 @@ from pathlib import Path
 
 import numpy as np
 
-SHAPENET_ROOT = Path("/work/courses/3dv/team15/superdec/data/ShapeNet")
+# Default dataset root; override with --shapenet_root. Layout expected:
+#   <root>/<category>/<instance>/pointcloud.npz   (+ a "gso" category)
+DEFAULT_SHAPENET_ROOT = Path("data/ShapeNet")
 SHAPENET_CATEGORIES = [
     "02876657",   # bottle
     "02880940",   # bowl
@@ -45,7 +47,7 @@ ORIENT_POLICY = {
 }
 
 
-def list_objects():
+def list_objects(shapenet_root: Path):
     """Return list of (source, pc_path, sem_id, cat_key) tuples.
 
     cat_key is the ShapeNet synset id for ShapeNet objects, or "gso" for GSO —
@@ -53,7 +55,7 @@ def list_objects():
     """
     out = []
     for cat in SHAPENET_CATEGORIES:
-        cat_dir = SHAPENET_ROOT / cat
+        cat_dir = shapenet_root / cat
         if not cat_dir.is_dir():
             continue
         sem = SEM_OBJ_START + SHAPENET_CATEGORIES.index(cat)
@@ -61,7 +63,7 @@ def list_objects():
             pc = inst / "pointcloud.npz"
             if pc.is_file():
                 out.append(("shapenet", pc, sem, cat))
-    gso_root = SHAPENET_ROOT / "gso"
+    gso_root = shapenet_root / "gso"
     if gso_root.is_dir():
         sem = SEM_OBJ_START + len(SHAPENET_CATEGORIES)
         for inst in sorted(gso_root.iterdir()):
@@ -142,6 +144,7 @@ def _palette(n: int) -> np.ndarray:
 def make_scene(
     seed: int,
     n_objects: int,
+    shapenet_root: Path = DEFAULT_SHAPENET_ROOT,
     table_size: tuple = (1.0, 0.7),
     table_height: float = 0.75,
     table_points: int = 8000,
@@ -152,9 +155,9 @@ def make_scene(
     rng = np.random.default_rng(seed)
     random.seed(seed)
 
-    pool = list_objects()
+    pool = list_objects(shapenet_root)
     if not pool:
-        raise SystemExit("No ShapeNet/GSO pointcloud.npz found under " + str(SHAPENET_ROOT))
+        raise SystemExit("No ShapeNet/GSO pointcloud.npz found under " + str(shapenet_root))
     # Diverse selection: round-robin across categories instead of a flat sample.
     picks = pick_round_robin(pool, n_objects, random)
     if len(picks) < n_objects:
@@ -256,6 +259,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed",        type=int,   default=0)
     ap.add_argument("--n_objects",   type=int,   default=8)
+    ap.add_argument("--shapenet_root", type=Path, default=DEFAULT_SHAPENET_ROOT,
+                    help="Dataset root with <cat>/<inst>/pointcloud.npz (+ gso/). "
+                         "Default: data/ShapeNet")
     ap.add_argument("--out",         default=None,
                     help="Output .npz path (default: data/synth/scene_<seed>.npz)")
     ap.add_argument("--table_w",     type=float, default=1.0)
@@ -276,6 +282,7 @@ def main():
     print(f"[make_synth] out={out_path}")
     scene = make_scene(
         seed=args.seed, n_objects=args.n_objects,
+        shapenet_root=args.shapenet_root,
         table_size=(args.table_w, args.table_d),
         table_height=args.table_h, table_points=args.table_points,
         obj_min_diameter=args.min_diam, obj_max_diameter=args.max_diam,

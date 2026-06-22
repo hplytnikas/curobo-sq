@@ -458,4 +458,12 @@ tmp*
 *.pt
 checkpoints*
 
+# Keep the committed fine-tuning checkpoints (rigid + bent, ~23 MB each) so the
+# finetuning/ deliverable is self-contained and reproducible.
+!finetuning/checkpoints/
+!finetuning/checkpoints/**
+
+# Keep the committed example data samples (a few .npz objects).
+!finetuning/data_samples/**/*.npz
+
 cuda_12.8.0_570.86.10_linux.run

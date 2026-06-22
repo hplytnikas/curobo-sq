@@ -21,7 +21,7 @@ seed: 42
 use_wandb: true
 wandb:
   project: superdec
-  entity: eyluloykusen
+  entity: null            # set to your wandb entity (or run with use_wandb: false)
 run_name: expocc_tt_bent
 dataset: shapenet
 device: cuda

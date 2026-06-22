@@ -41,12 +41,6 @@ CATEGORY_NAMES = {
     "gso": "gso",
 }
 SHAPENET_ROOT = "data/ShapeNet"
-EXTRA_PLY_DIRS = [
-    ("stage3", os.path.expanduser("~/Downloads/stage3_seg")),
-]
-EXTRA_PLY_FILES = [
-    ("stage2", os.path.expanduser("~/Downloads/stage2.ply")),
-]
 
 
 def load_model(ckpt_dir: str, ckpt_file: str, device: str):
@@ -61,10 +55,10 @@ def load_model(ckpt_dir: str, ckpt_file: str, device: str):
     return model, extended
 
 
-def gather_test_models() -> list:
+def gather_test_models(shapenet_root: str = SHAPENET_ROOT, extra_ply: list = None) -> list:
     items = []
     for cat in CATEGORIES:
-        lst = os.path.join(SHAPENET_ROOT, cat, "test.lst")
+        lst = os.path.join(shapenet_root, cat, "test.lst")
         if not os.path.isfile(lst):
             continue
         with open(lst) as f:
@@ -72,18 +66,17 @@ def gather_test_models() -> list:
                 mid = line.strip()
                 if not mid:
                     continue
-                pc = os.path.join(SHAPENET_ROOT, cat, mid, "pointcloud.npz")
+                pc = os.path.join(shapenet_root, cat, mid, "pointcloud.npz")
                 if os.path.isfile(pc):
                     items.append((CATEGORY_NAMES.get(cat, cat), mid, pc))
-    for tag, dirpath in EXTRA_PLY_DIRS:
-        if not os.path.isdir(dirpath):
-            continue
-        for fn in sorted(os.listdir(dirpath)):
-            if fn.endswith(".ply"):
-                items.append((tag, os.path.splitext(fn)[0], os.path.join(dirpath, fn)))
-    for tag, filepath in EXTRA_PLY_FILES:
-        if os.path.isfile(filepath):
-            items.append((tag, os.path.splitext(os.path.basename(filepath))[0], filepath))
+    # Optional extra .ply files/dirs to inspect alongside the test set.
+    for path in (extra_ply or []):
+        if os.path.isdir(path):
+            for fn in sorted(os.listdir(path)):
+                if fn.endswith(".ply"):
+                    items.append(("extra", os.path.splitext(fn)[0], os.path.join(path, fn)))
+        elif os.path.isfile(path) and path.endswith(".ply"):
+            items.append(("extra", os.path.splitext(os.path.basename(path))[0], path))
     return items
 
 
@@ -146,6 +139,10 @@ def main():
     ap.add_argument("--ckpt_dir", default="checkpoints/expocc_tt_bent",
                     help="folder with epoch_*.pt + config.yaml")
     ap.add_argument("--ckpt_file", default="epoch_100.pt")
+    ap.add_argument("--shapenet_root", default=SHAPENET_ROOT,
+                    help="Dataset root with <cat>/test.lst + <cat>/<inst>/pointcloud.npz")
+    ap.add_argument("--extra_ply", nargs="*", default=None,
+                    help="Optional extra .ply files or dirs to view alongside the test set")
     ap.add_argument("--port", type=int, default=8081)
     args = ap.parse_args()
 
@@ -156,9 +153,9 @@ def main():
     model, extended = load_model(ckpt_dir, ckpt_file, device)
     Handler = PredictionHandlerExtended if extended else PredictionHandlerConvex
 
-    items = gather_test_models()
+    items = gather_test_models(args.shapenet_root, args.extra_ply)
     if not items:
-        raise RuntimeError("no test models found under data/ShapeNet/<cat>/")
+        raise RuntimeError(f"no test models found under {args.shapenet_root}/<cat>/")
     print(f"{len(items)} test models")
 
     cache: Dict[Tuple, Tuple[object, np.ndarray, np.ndarray]] = {}

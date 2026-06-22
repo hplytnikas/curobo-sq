@@ -3,7 +3,7 @@
 # foundation that all paper runs build on) but retargeted to our 5 ShapeNet
 # tabletop categories + GSO instead of ShapeNet-13 / ABO.
 #
-# Resume target: superdec_concave_old/checkpoints/shapenet/ckpt.pt
+# Resume target: checkpoints/shapenet_foundation/ckpt.pt
 # (the released SuperDec ShapeNet-13 rigid checkpoint, rotation6d=false).
 #
 # Outputs pseudo-GT for the student stage after Phase C (test-time optim).
@@ -12,7 +12,7 @@ seed: 42
 use_wandb: true
 wandb:
   project: superdec
-  entity: eyluloykusen
+  entity: null            # set to your wandb entity (or run with use_wandb: false)
 run_name: exp_tt
 dataset: shapenet
 device: cuda
