@@ -1757,17 +1757,12 @@ def single_frame_pipeline(
                 if not _torch.cuda.is_available():
                     raise RuntimeError("no CUDA GPU available")
                 from superdec_fitter import SuperdecFitter as _SDF
-                _superdec_dir = os.environ.get(
-                    'SUPERDEC_DIR',
-                    '/work/courses/3dv/team15/superdec',
-                )
-                _ckpt_dir = os.environ.get(
-                    'SUPERDEC_CKPT_DIR',
-                    '/work/courses/3dv/team15/checkpoints/'
-                    'superdec_tabletop/superdec_tabletop_finetune_v2',
-                )
-                _fitter = _SDF(superdec_dir=_superdec_dir,
-                               checkpoint_dir=_ckpt_dir)
+                try:
+                    from .paths import superdec_dir, superdec_checkpoint_dir
+                except ImportError:
+                    from paths import superdec_dir, superdec_checkpoint_dir
+                _fitter = _SDF(superdec_dir=superdec_dir(),
+                               checkpoint_dir=superdec_checkpoint_dir())
                 _use_superdec = True
             except Exception as exc:
                 _log.warning(
