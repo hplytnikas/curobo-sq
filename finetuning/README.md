@@ -6,7 +6,7 @@
 - `superdec/`    — partial-view evaluation code
 - `result/`      — reconstruction-quality table (paper Table 1)
 - `demo_viser.py`— qualitative superquadric-fit visualizations
-- `patches/`     — my edits to upstream files (dataloader, loss, trainer)
+- `patches/`     — our edits to upstream files (dataloader, loss, trainer)
 
 ## Pipeline (reproduce the deployed rigid checkpoint)
 0. `scripts/preprocess_shapenet_occupancy.py`   — occupancy for ShapeNet tabletop objects (from binvox)
