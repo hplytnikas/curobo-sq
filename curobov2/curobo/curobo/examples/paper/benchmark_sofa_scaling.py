@@ -38,7 +38,6 @@ from scipy.spatial import cKDTree
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import motion_planning_sq_demo as demo  # noqa: E402
 import benchmark_sq_vs_mesh as bench  # noqa: E402
-import sofa_viz  # noqa: E402
 
 from curobo._src.geom.types import SceneCfg, Mesh  # noqa: E402
 from curobo._src.types.device_cfg import DeviceCfg  # noqa: E402
@@ -265,7 +264,7 @@ def _run_scene(
                 JointState.from_position(last, joint_names=interp.joint_names)
             )
             if visualize is not None:
-                sofa_viz.animate(visualize, pos_per_step, interp.joint_names, bench.PLAYBACK_HZ)
+                bench._animate(visualize, interp)
         else:
             print(f"  [{representation}] {scene['name']} leg {leg + 1}: FAILED to plan")
 
@@ -317,7 +316,14 @@ def main() -> None:
 
     visualize = None
     if args.visualize:
-        visualize = sofa_viz.make_visualizer(args.port)
+        from curobo.types import ContentPath
+        from curobo.viewer import ViserVisualizer
+        visualize = ViserVisualizer(
+            content_path=ContentPath(robot_config_file="franka.yml"),
+            connect_ip="0.0.0.0", connect_port=args.port,
+            add_control_frames=False, visualize_robot_spheres=False,
+        )
+        print(f"Viser running at http://localhost:{args.port}")
 
     all_rows: List[dict] = []
     for n in counts:
