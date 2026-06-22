@@ -77,7 +77,7 @@ class CuroboPlannerNode(Node):
 
         self.is_holding_object = False
 
-        # 2. Initialize cuRobo Motion Planner
+        # Initialize cuRobo Motion Planner
         self.get_logger().info("Initializing cuRobo Motion Planner...")
         config = MotionPlannerCfg.create(
             robot=robot_cfg,
@@ -87,6 +87,8 @@ class CuroboPlannerNode(Node):
         # Override scene_model config with our explicitly declared scene
         config.scene_collision_cfg.scene_model = self.scene_config
 
+
+        # configure planner and attachment manager
         self.planner = MotionPlanner(config)
         self.planner.warmup(enable_graph=True, num_warmup_iterations=5)
         self.get_logger().info("cuRobo warmup complete. Ready for goal poses.")
@@ -101,8 +103,7 @@ class CuroboPlannerNode(Node):
             device_cfg=self.device_config
         )
 
-        # 3. ROS 2 Interfaces
-
+        # ROS 2 Interfaces
         self._action_server = ActionServer(
             self,
             Move,
@@ -166,7 +167,7 @@ class CuroboPlannerNode(Node):
             10
         )
 
-        # 4. State caching & translation map
+        # State caching & translation map
         self.current_joint_state = None
         self.arm_joint_map = {
             "panda_joint1": "fp3_joint1",
@@ -196,7 +197,7 @@ class CuroboPlannerNode(Node):
 
         sq_list = [self.ground_plane]
 
-        # 1. Map the active objects from the ROS message
+        # Map the active objects from the ROS message
         for i, sq_msg in enumerate(msg.superquadrics):
             if i + 1 >= self.max_dynamic_obstacles:
                 self.get_logger().warn(f"Exceeded max obstacles ({self.max_dynamic_obstacles})! Ignoring extras.")
@@ -218,8 +219,8 @@ class CuroboPlannerNode(Node):
             )
             sq_list.append(curobo_sq)
 
-        # 2. Pad the remainder of the array up to max_dynamic_obstacles
-        # This keeps the underlying tensor size static so the CUDA graph doesn't break!
+        # Pad the remainder of the array up to max_dynamic_obstacles This keeps
+        # the underlying tensor size static so the CUDA graph doesn't break!
         for i in range(len(sq_list), self.max_dynamic_obstacles):
             sq_list.append(
                 Superquadric(
@@ -230,7 +231,7 @@ class CuroboPlannerNode(Node):
                 )
             )
 
-        # 3. Update the stored configuration and inject into the planner
+        # Update the stored configuration and inject into the planner
         self.scene_config = SceneCfg(
             superquadric=sq_list
         )
@@ -262,18 +263,15 @@ class CuroboPlannerNode(Node):
                 marker.pose.orientation.y = float(sq.pose[5])
                 marker.pose.orientation.z = float(sq.pose[6])
 
-                # Scale property must remain 1.0 since the vertices are explicitly scaled
                 marker.scale.x = 1.0
                 marker.scale.y = 1.0
                 marker.scale.z = 1.0
 
-                # Stylized translucent asset properties
                 marker.color.r = 0.1
                 marker.color.g = 0.7
                 marker.color.b = 0.9
                 marker.color.a = 0.5
 
-                # Build and inject the highly accurate vertex matrix mapping
                 marker.points = sample_superquadric_mesh(sq.radii, sq.shape, grid_res=32)
                 marker_array.markers.append(marker)
 
@@ -285,7 +283,7 @@ class CuroboPlannerNode(Node):
         if not self.is_holding_object:
             return
 
-        # 1. Access the underlying kinematics parameters holding the link-local allocations
+        # Access the underlying kinematics parameters holding the link-local allocations
         kparams = self.attachment_manager.kinematics_params
         try:
             link_sphere_idx = kparams.get_sphere_index_from_link_name("attached_object")
@@ -293,8 +291,6 @@ class CuroboPlannerNode(Node):
             self.get_logger().error(f"Failed to find attached_object link index: {e}")
             return
 
-        # 2. Extract the local coordinates for environment 0
-        # Shape: [num_allocated_slots, 4] -> (local_x, local_y, local_z, radius)
         local_spheres = kparams.link_spheres[0, link_sphere_idx, :]
 
         self.get_logger().error(f"Trying to publish: {local_spheres}")
@@ -305,12 +301,11 @@ class CuroboPlannerNode(Node):
         for i in range(local_spheres.shape[0]):
             radius = float(local_spheres[i, 3])
 
-            # Filter out empty or unallocated padding slots (marked by cuRobo as <= 0.0)
+            # Filter out empty or unallocated padding slots
             if radius <= 0.0:
                 continue
 
             marker = Marker()
-            # Offload spatial tracking directly to the robot's active TF frame
             marker.header.frame_id = "fp3_hand"
             marker.frame_locked = True
             marker.ns = "attached_collision_spheres_tf"
@@ -318,18 +313,15 @@ class CuroboPlannerNode(Node):
             marker.type = Marker.SPHERE
             marker.action = Marker.ADD
 
-            # Set local spatial offsets relative to the fp3_hand origin
             marker.pose.position.x = float(local_spheres[i, 0])
             marker.pose.position.y = float(local_spheres[i, 1])
             marker.pose.position.z = float(local_spheres[i, 2])
-            marker.pose.orientation.w = 1.0  # Spheres are rotationally invariant
+            marker.pose.orientation.w = 1.0
 
-            # Diameter scale = 2.0 * radius
             marker.scale.x = radius * 2.0
             marker.scale.y = radius * 2.0
             marker.scale.z = radius * 2.0
 
-            # Translucent vibrant orange visual profile for collision boundaries
             marker.color.r = 1.0
             marker.color.g = 0.4
             marker.color.b = 0.0
@@ -346,19 +338,14 @@ class CuroboPlannerNode(Node):
         marker_array = MarkerArray()
 
         marker = Marker()
-        # The frame and timestamp are good practice, but the namespace is what matters most here
-        marker.header.frame_id = "fp3_hand"
-        # timestamp mapping for ROS 2 (e.g., self.get_clock().now().to_msg()) can go here if needed
 
-        # CRITICAL: This must match the exact namespace you want to clear
+        marker.header.frame_id = "fp3_hand"
         marker.ns = "attached_collision_spheres_tf"
 
-        # This signal instructs RViz to delete everything under this namespace
         marker.action = Marker.DELETEALL
 
         marker_array.markers.append(marker)
 
-        # Publish the clearance message
         self.attached_spheres_marker_pub.publish(marker_array)
         self.get_logger().info("Sent command to clear all attached collision sphere markers.")
 
@@ -390,7 +377,7 @@ class CuroboPlannerNode(Node):
         pos = curobo_interpolated_trajectory.position.detach().cpu().numpy().squeeze()
         vel = curobo_interpolated_trajectory.velocity.detach().cpu().numpy().squeeze()
 
-        # Ensure dimensions stay healthy even if a trajectory has only 1 row step
+        # Ensure consistent dimensions
         if pos.ndim == 1:
             pos = np.expand_dims(pos, axis=0)
         if vel.ndim == 1:
@@ -403,6 +390,7 @@ class CuroboPlannerNode(Node):
         )
 
     def _get_current_state(self):
+        """Fetch either the current robot state or the default joint configuratiuon if unavailable"""
         if self.current_joint_state is not None:
             return self.current_joint_state
         self.get_logger().warn("No /joint_states received yet, using default joint state.")
@@ -412,6 +400,7 @@ class CuroboPlannerNode(Node):
         )
 
     def _msg_to_goal_pose(self, msg):
+        """datatype coversion helper"""
         pos = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]
         quat = [msg.pose.orientation.w, msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z]
         return GoalToolPose(
@@ -421,10 +410,12 @@ class CuroboPlannerNode(Node):
         )
 
     async def execute_move(self, goal_handle):
+        """move the robotic arm to the target pose"""
         msg = goal_handle.request.target_pose
         self.get_logger().info("Received standard Move action.")
         self.publish_scene_markers()
 
+        # plan trajectory
         q_start = self._get_current_state()
         goal_pose = self._msg_to_goal_pose(msg)
         action_result = Move.Result()
@@ -441,6 +432,7 @@ class CuroboPlannerNode(Node):
 
         gripper_target_pos = 0.0 if self.is_holding_object else 0.04
 
+        # forward to controller
         exec_success = await self.execute_trajectory_ros2(plan, dt, gripper_target_pos, timescale=self.timescale)
 
         if not exec_success:
@@ -453,6 +445,7 @@ class CuroboPlannerNode(Node):
         return action_result
 
     async def execute_grasp(self, goal_handle):
+        """execute a three-phase grasping maneuver"""
         action_result = Grasp.Result()
 
         if self.is_holding_object:
@@ -467,6 +460,7 @@ class CuroboPlannerNode(Node):
         self.get_logger().info(f"Received Grasp action for {len(sq_obstacles_msg)} objects.")
         self.publish_scene_markers()
 
+        # plan trajectory
         q_start = self._get_current_state()
         goal_pose = self._msg_to_goal_pose(msg)
 
@@ -489,7 +483,7 @@ class CuroboPlannerNode(Node):
             self.to_cpu_plan(results.lift_interpolated_trajectory)
         ]
 
-        # Exact middle-trajectory extraction for geometric attachment
+        # Exact middle-trajectory extraction for grasped object attachment
         grasp_positions = plans_to_execute[1].positions
         if grasp_positions.ndim == 3:
             grasp_final_pos_np = grasp_positions[:, -1, :]
@@ -504,8 +498,6 @@ class CuroboPlannerNode(Node):
             joint_names=self.planner.joint_names
         )
 
-        print(q_grasp_attachment)
-
         world_objects_pose_offset = CuroboPose(
             position=torch.tensor(
                 [[msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]],
@@ -519,6 +511,7 @@ class CuroboPlannerNode(Node):
 
         dt = self.planner.trajopt_solver.config.interpolation_dt
 
+        # execute plans
         for phase_idx, plan in enumerate(plans_to_execute):
             gripper_target_pos = 0.035 if phase_idx == 0 else 0.0
             exec_success = await self.execute_trajectory_ros2(plan, dt, gripper_target_pos, timescale=self.timescale)
@@ -529,6 +522,7 @@ class CuroboPlannerNode(Node):
                 action_result.success = False
                 return action_result
 
+        # determine relative position of grasped objects
         curobo_obstacles = []
         for sq in sq_obstacles_msg:
             curobo_obstacles.append(
@@ -541,6 +535,7 @@ class CuroboPlannerNode(Node):
                 )
             )
 
+        # attach grasped object to robot model
         self.attachment_manager.attach(
             joint_states=q_grasp_attachment,
             obstacles=curobo_obstacles,
@@ -557,6 +552,7 @@ class CuroboPlannerNode(Node):
         return action_result
 
     async def execute_release(self, goal_handle):
+        """release the currently grasped object"""
         action_result = Release.Result()
 
         if not self.is_holding_object:
@@ -567,7 +563,7 @@ class CuroboPlannerNode(Node):
 
         self.get_logger().info("Received Release action. Opening gripper...")
 
-        # Execute physical release
+        # Execute release
         exec_success = await self._actuate_gripper_async(target_pos=0.04)
         if not exec_success:
             self.get_logger().error("✗ Failed to actuate gripper open.")
@@ -575,7 +571,7 @@ class CuroboPlannerNode(Node):
             action_result.success = False
             return action_result
 
-        # Detach from kinematic model
+        # Detach from robot model
         self.attachment_manager.detach(link_name="attached_object")
         self.is_holding_object = False
         self.delete_attached_spheres_markers()
@@ -586,6 +582,7 @@ class CuroboPlannerNode(Node):
         return action_result
 
     async def execute_trajectory_ros2(self, interpolated_plan, dt, gripper_pos, timescale=1.0):
+        """execute a cuRobo plan through ros2_control"""
         pos = interpolated_plan.positions
         vel = interpolated_plan.velocities / timescale
         curobo_names = interpolated_plan.joint_names
@@ -602,6 +599,7 @@ class CuroboPlannerNode(Node):
         last_kept_idx = 0
         ros_point_counter = 0
 
+        # convert plan to ros2 control trajectories
         for i in range(num_states):
             if i > 0 and i < (num_states - 1):
                 if np.allclose(pos[i, arm_indices], pos[last_kept_idx, arm_indices], atol=1e-6):
@@ -619,6 +617,7 @@ class CuroboPlannerNode(Node):
                 pt.time_from_start = duration
                 arm_goal.trajectory.points.append(pt)
 
+        # forward plan to controller nodes
         if arm_indices:
             if not self._action_client.wait_for_server(timeout_sec=2.0):
                 self.get_logger().error('Arm action server not available!')
@@ -663,7 +662,7 @@ class CuroboPlannerNode(Node):
             return False
 
         self.get_logger().info("Gripper actuation complete.")
-        time.sleep(1) # Let the physical grab settle
+        time.sleep(1)
         return True
 
 

@@ -455,7 +455,6 @@ random*
 *.o
 superdec/fast_sampler/_sampler.cpp
 render*
-*.mp4
 build*
 tmp*
 *.pt
