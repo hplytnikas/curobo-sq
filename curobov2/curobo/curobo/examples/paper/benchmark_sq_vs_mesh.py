@@ -105,6 +105,14 @@ ORIG_MESH_NAMES = ["model_normalized.obj", "model.obj", "mesh.obj", "mesh.off",
 # for a strict "any penetration" criterion.
 COLLISION_SKIN_M = 0.0
 
+# CSV schema shared by the tabletop and sofa-scaling benchmarks.
+BENCH_FIELDNAMES = [
+    "scene", "n_objects", "n_primitives", "representation", "leg", "plan_success",
+    "plan_wall_s", "plan_solver_total_s", "motion_time_s", "playback_s",
+    "n_steps_total", "n_steps_collide", "n_spheres_collide",
+    "frac_in_collision", "max_penetration_m",
+]
+
 
 def scene_geometry(n: int) -> Tuple[float, float, float, float]:
     """Return (inner_r, outer_r, table_half, object_size_m) for ``n`` objects.
@@ -784,12 +792,7 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
         )
         print(f"Viser running at http://localhost:{args.port}")
 
-    fieldnames = [
-        "scene", "n_objects", "n_primitives", "representation", "leg", "plan_success",
-        "plan_wall_s", "plan_solver_total_s", "motion_time_s", "playback_s",
-        "n_steps_total", "n_steps_collide", "n_spheres_collide",
-        "frac_in_collision", "max_penetration_m",
-    ]
+    fieldnames = BENCH_FIELDNAMES
     all_rows: List[dict] = []
 
     for scene in scenes:
