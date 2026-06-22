@@ -79,6 +79,9 @@ the files are in place. Run the commands from the paper folder:
 cd curobov2/curobo/curobo/examples/paper
 ```
 
+Finetuning of SuperDec/SuperFlex is described seperately - please refer to the
+`finetuning` directory.
+
 ### 1. Download the assets
 
 Download the four files below and extract them into `data/paper/` (paths are
