@@ -64,7 +64,7 @@ _DEFAULT_TARGET_POSITIONS = [
 _DOWN_QUAT_WXYZ = [0.0, 1.0, 0.0, 0.0]   # EE pointing down
 DEFAULT_TARGETS = [p + _DOWN_QUAT_WXYZ for p in _DEFAULT_TARGET_POSITIONS]
 
-DEFAULT_PLY = str(demo.SUPERDEC_ROOT / "examples" / "chair.ply")
+DEFAULT_PLY = str(demo.ASSETS_ROOT / "chair.ply")
 
 
 # ── object loading ───────────────────────────────────────────────────────────────

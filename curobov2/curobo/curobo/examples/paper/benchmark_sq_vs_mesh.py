@@ -8,8 +8,9 @@ Workflow (three subcommands):
 
   1. build        Build a fixed family of tabletop scenes with increasing object
                   counts (1, 5, 10, 15, 25, 50, 100, 200), run SuperDec once, and
-                  pickle everything to ``eval_out/scenes_cache.pkl`` so the scenes
-                  are computed exactly once and are fully reproducible.
+                  pickle everything to ``data/paper/scenes_cache.pkl`` so the scenes
+                  are computed exactly once and are fully reproducible.  (A prebuilt
+                  cache can be downloaded instead — see the repo README.)
 
   2. set-targets  Open a viser UI to set & save 4 end-effector targets per scene
                   (so the planned trajectories are non-trivial).  Saved to
@@ -63,11 +64,14 @@ from superdec.utils.predictions_handler import PredictionHandler  # noqa: E402
 
 # ── configuration ───────────────────────────────────────────────────────────────
 
+# Generated outputs (targets, results, figures) live next to the scripts in eval_out/.
 OUT_DIR = Path(__file__).resolve().parent / "eval_out"
-SCENES_CACHE = OUT_DIR / "scenes_cache.pkl"
 TARGETS_JSON = OUT_DIR / "targets.json"
 RESULTS_CSV = OUT_DIR / "results.csv"
 RESULTS_FIDELITY_CSV = OUT_DIR / "results_fidelity.csv"
+
+# The (downloadable / built) scene cache lives in the single paper-assets folder.
+SCENES_CACHE = demo.ASSETS_ROOT / "scenes_cache.pkl"
 
 # Mesh-fidelity sweep (tessellation grid resolution N for each superquadric).
 # Triangle count per superquadric grows ~2*(N-1)**2, so cost rises steeply with N
@@ -386,6 +390,7 @@ def _count_mesh_triangles(scene_cfg: SceneCfg) -> int:
 
 def cmd_build(args: argparse.Namespace) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    SCENES_CACHE.parent.mkdir(parents=True, exist_ok=True)
     wp.init()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Loading ShapeNet dataset…")
@@ -406,18 +411,23 @@ def cmd_build(args: argparse.Namespace) -> None:
     print(f"\nWrote {len(scenes)} scenes to {SCENES_CACHE}")
 
 
-def _load_scenes() -> List[dict]:
-    if not SCENES_CACHE.exists():
-        raise SystemExit(f"No scene cache at {SCENES_CACHE}. Run the 'build' subcommand first.")
-    with open(SCENES_CACHE, "rb") as f:
+def _load_scenes(path: Optional[Path] = None) -> List[dict]:
+    path = Path(path) if path is not None else SCENES_CACHE
+    if not path.exists():
+        raise SystemExit(
+            f"No scene cache at {path}. Either run the 'build' subcommand first, or "
+            "download a prebuilt scenes_cache.pkl and pass it with --scenes_cache."
+        )
+    with open(path, "rb") as f:
         return pickle.load(f)
 
 
 # ── target setting UI ─────────────────────────────────────────────────────────────
 
-def _load_targets() -> Dict[str, List[List[float]]]:
-    if TARGETS_JSON.exists():
-        with open(TARGETS_JSON) as f:
+def _load_targets(path: Optional[Path] = None) -> Dict[str, List[List[float]]]:
+    path = Path(path) if path is not None else TARGETS_JSON
+    if path.exists():
+        with open(path) as f:
             return json.load(f)
     return {}
 
@@ -829,10 +839,13 @@ def _animate(viser_viz, interp: JointState) -> None:
 def cmd_benchmark(args: argparse.Namespace) -> None:
     wp.init()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    scenes = _load_scenes()
-    targets = _load_targets()
+    scenes = _load_scenes(args.scenes_cache)
+    targets = _load_targets(args.targets)
     if not targets:
-        raise SystemExit(f"No targets at {TARGETS_JSON}. Run the 'set-targets' subcommand first.")
+        raise SystemExit(
+            f"No targets at {args.targets or TARGETS_JSON}. Run the 'set-targets' subcommand "
+            "first, or pass a downloaded targets.json with --targets."
+        )
 
     if args.counts:
         scenes = [s for s in scenes if s["n_objects"] in args.counts]
@@ -890,10 +903,13 @@ def cmd_benchmark_fidelity(args: argparse.Namespace) -> None:
     """
     wp.init()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    scenes = _load_scenes()
-    targets = _load_targets()
+    scenes = _load_scenes(args.scenes_cache)
+    targets = _load_targets(args.targets)
     if not targets:
-        raise SystemExit(f"No targets at {TARGETS_JSON}. Run the 'set-targets' subcommand first.")
+        raise SystemExit(
+            f"No targets at {args.targets or TARGETS_JSON}. Run the 'set-targets' subcommand "
+            "first, or pass a downloaded targets.json with --targets."
+        )
 
     if args.counts:
         scenes = [s for s in scenes if s["n_objects"] in args.counts]
@@ -951,7 +967,7 @@ def main() -> None:
 
     def _common(p):
         p.add_argument("--shapenet_root", type=str,
-                       default=str(demo.WORKSPACE_ROOT / "data" / "ShapeNet"))
+                       default=str(demo.ASSETS_ROOT / "ShapeNet_test"))
         p.add_argument("--checkpoint_folder", type=str, default=demo.CHECKPOINT_FOLDER)
         p.add_argument("--mesh_resolution", type=int, default=48)
         p.add_argument("--counts", type=_parse_counts, default=None,
@@ -965,11 +981,25 @@ def main() -> None:
     _common(p_targets)
     p_targets.add_argument("--port", type=int, default=8081)
 
-    p_bench = sub.add_parser("benchmark", help="Run the SQ-vs-mesh benchmark")
+    p_bench = sub.add_parser(
+        "benchmark",
+        help="Run the SQ-vs-mesh benchmark (uses prebuilt scenes + targets; no "
+             "ShapeNet or SuperDec checkpoint required)",
+    )
     _common(p_bench)
     p_bench.add_argument("--device", type=str, default="cuda")
     p_bench.add_argument("--visualize", action="store_true", help="Animate runs in viser")
     p_bench.add_argument("--port", type=int, default=8082)
+    p_bench.add_argument(
+        "--scenes_cache", type=str, default=None,
+        help="Path to a prebuilt scenes_cache.pkl (default: eval_out/scenes_cache.pkl). "
+             "Lets you run the benchmark from a downloaded cache without the 'build' step.",
+    )
+    p_bench.add_argument(
+        "--targets", type=str, default=None,
+        help="Path to a saved targets.json (default: eval_out/targets.json). "
+             "Lets you run the benchmark from downloaded targets without the 'set-targets' step.",
+    )
     p_bench.add_argument(
         "--fidelity", type=_parse_counts, nargs="?", const=list(DEFAULT_FIDELITY_LEVELS),
         default=None,

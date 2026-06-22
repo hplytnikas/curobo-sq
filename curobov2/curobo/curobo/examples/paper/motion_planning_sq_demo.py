@@ -4,17 +4,27 @@ Five deterministic scenes are generated from random ShapeNet objects placed on
 the robot's tabletop workspace. Select scenes and representation (SQ / mesh) from
 the Viser web UI.
 
-ShapeNet must be downloaded locally before running::
+All downloaded assets live in one folder at the repo root, ``data/paper/`` (see
+the repository README "Reproducing the Paper Results"). A ShapeNet subset must be
+present before running. Only the **test split** of the tabletop categories is
+needed (not the full dataset): the loader reads each ``{synset}/test.lst`` and
+uses only the models whose ``{model}/pointcloud.npz`` is actually present, so a
+handful of test samples per category is enough. Layout (ONet/ConvONet format)::
+
+    data/paper/ShapeNet_test/{synset}/test.lst
+    data/paper/ShapeNet_test/{synset}/{model}/pointcloud.npz
+
+Alternatively, fetch the PyG part-annotation dataset into that folder::
 
     conda run -n 3dv python -c "
         from torch_geometric.datasets import ShapeNet
-        ShapeNet(root='data/ShapeNet', split='test')
+        ShapeNet(root='data/paper/ShapeNet_test', split='test')
     "
 
-Then launch::
+The SuperDec checkpoint defaults to ``data/paper/tabletop_finetuned`` (override
+with ``--checkpoint_folder``). Then launch::
 
-    conda run -n 3dv python motion_planning_sq_demo.py \\
-        --checkpoint_folder /home/haroldas/3DV/superdec/checkpoints/tabletop_finetuned
+    conda run -n 3dv python motion_planning_sq_demo.py
 """
 
 from __future__ import annotations
@@ -46,6 +56,9 @@ from curobo.viewer import ViserVisualizer
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[5]
 SUPERDEC_ROOT = WORKSPACE_ROOT / "superdec"
+# Single root folder for all downloaded paper assets (checkpoint, ShapeNet subset,
+# chair.ply, scenes_cache.pkl). See the repo README "Reproducing the Paper Results".
+ASSETS_ROOT = WORKSPACE_ROOT / "data" / "paper"
 if str(SUPERDEC_ROOT) not in sys.path:
     sys.path.append(str(SUPERDEC_ROOT))
 
@@ -64,7 +77,7 @@ except ImportError:
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-CHECKPOINT_FOLDER = "/home/haroldas/3DV/superdec/checkpoints/tabletop_finetuned"
+CHECKPOINT_FOLDER = str(ASSETS_ROOT / "tabletop_finetuned")
 CKPT_FILE = "ckpt.pt"
 
 TABLE = Cuboid(
@@ -315,6 +328,14 @@ class _LocalShapeNetDataset:
         for i, cat in enumerate(self._item_categories):
             self._items_by_category.setdefault(cat, []).append(i)
 
+        if not self._items:
+            raise RuntimeError(
+                f"No ShapeNet models found under '{root}' for split '{split or 'all'}'.\n"
+                "The split list(s) were read but no matching '{model}/pointcloud.npz' files "
+                "exist on disk. Download at least a few of the listed test-split models into "
+                "{root}/{synset}/{model}/pointcloud.npz (you do not need the full dataset)."
+            )
+
         cat_names = sorted(self._items_by_category.keys())
         print(f"  LocalShapeNet: {len(self._items)} models from {cat_names} (split={split or 'all'})")
 
@@ -349,24 +370,38 @@ class _GSODataset:
         return _LocalShapeNetItem(pts)
 
 
-def _load_shapenet(root: str, categories: List[str]):
+def _load_shapenet(root: str, categories: List[str], split: Optional[str] = "test"):
     """Load ShapeNet dataset.
 
     Prefers the local ONet/ConvONet format ({root}/{synset}/{model}/pointcloud.npz).
     Falls back to PyG ShapeNet if the local format is not present.
+
+    Only the requested ``split`` (default "test") is loaded: each synset's
+    ``{split}.lst`` file lists the model ids, and only those whose
+    ``pointcloud.npz`` is actually present on disk are used.  This means you can
+    ship just a subset of ShapeNet -- e.g. the test-split models for the tabletop
+    categories -- instead of the full dataset.  Pass ``split=None`` to load every
+    model directory found on disk regardless of the split files.
     """
-    # Detect local ONet-format: at least one synset directory with pointcloud.npz files
+    # Detect the local ONet format: a synset directory either exposes a split
+    # list ({split}.lst) or already contains at least one {model}/pointcloud.npz.
     local_synsets = [
         d for d in os.listdir(root)
         if os.path.isdir(os.path.join(root, d)) and d not in ("gso", "raw") and not d.startswith(".")
     ] if os.path.isdir(root) else []
-    has_local = any(
-        os.path.isfile(os.path.join(root, s, m, "pointcloud.npz"))
-        for s in local_synsets
-        for m in (os.listdir(os.path.join(root, s))[:1] if os.path.isdir(os.path.join(root, s)) else [])
-    )
-    if has_local:
-        return _LocalShapeNetDataset(root, categories, split=None)
+
+    def _synset_is_local(s: str) -> bool:
+        synset_dir = os.path.join(root, s)
+        if split is not None and os.path.isfile(os.path.join(synset_dir, f"{split}.lst")):
+            return True
+        return any(
+            os.path.isfile(os.path.join(synset_dir, m, "pointcloud.npz"))
+            for m in os.listdir(synset_dir)
+            if os.path.isdir(os.path.join(synset_dir, m))
+        )
+
+    if any(_synset_is_local(s) for s in local_synsets):
+        return _LocalShapeNetDataset(root, categories, split=split)
 
     from torch_geometric.datasets import ShapeNet
     raw_dir = os.path.join(root, "raw")
@@ -374,11 +409,12 @@ def _load_shapenet(root: str, categories: List[str]):
         raise RuntimeError(
             f"ShapeNet data not found at '{root}'.\n"
             "Either place ONet-format data ({synset}/{model}/pointcloud.npz) directly in that "
-            "folder, or download the PyG part-annotation dataset with:\n"
+            "folder (only the test-split models are needed), or download the PyG "
+            "part-annotation dataset with:\n"
             f"  python -c \"from torch_geometric.datasets import ShapeNet; "
             f"ShapeNet(root='{root}', split='test')\""
         )
-    return ShapeNet(root=root, categories=categories, split="test")
+    return ShapeNet(root=root, categories=categories, split=split or "test")
 
 
 def _shapenet_item_to_zup(item, size_m: float, color_idx: int, dataset_type: str = "shapenet") -> Tuple[np.ndarray, np.ndarray]:
@@ -1259,8 +1295,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--shapenet_root",
         type=str,
-        default=str(WORKSPACE_ROOT / "data" / "ShapeNet"),
+        default=str(ASSETS_ROOT / "ShapeNet_test"),
         help="Root directory of the ShapeNet dataset (ONet .npz format or PyG part-annotation)",
+    )
+    parser.add_argument(
+        "--shapenet_split",
+        type=str,
+        default="test",
+        help="ShapeNet split to load from {synset}/{split}.lst (default: test). "
+             "Use 'all' to load every model directory present on disk.",
     )
     parser.add_argument(
         "--checkpoint_folder",
@@ -1309,7 +1352,8 @@ def main() -> None:
         shapenet_dataset = None
     else:
         print("Loading ShapeNet dataset…")
-        shapenet_dataset = _load_shapenet(args.shapenet_root, TABLETOP_CATEGORIES)
+        split = None if args.shapenet_split.lower() == "all" else args.shapenet_split
+        shapenet_dataset = _load_shapenet(args.shapenet_root, TABLETOP_CATEGORIES, split=split)
         print(f"ShapeNet loaded: {len(shapenet_dataset)} models")
         base_configs = SCENE_BUILD_CONFIGS
         if args.num_scenes is not None:

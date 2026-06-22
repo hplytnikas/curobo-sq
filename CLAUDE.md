@@ -8,7 +8,6 @@ This project integrates **superquadric obstacle representations** into [CuRobo](
 
 1. **SuperDec** (`superdec/`): Neural network (transformer encoder-decoder) that decomposes 3D point clouds into superquadric primitives
 2. **CuRobo** (`curobo/`): Fork with native superquadric SDF/collision kernels added
-3. **OpenGJK** (`openGJK/`): Standalone GJK collision library — **not used in the planning pipeline**; kept for independent geometry validation only
 
 ## Python Environment
 
@@ -61,14 +60,3 @@ conda run -n 3dv python \
 - **Decoder**: `TransformerDecoder` (n_queries=16 superquadrics, n_layers=3, n_heads=1)
 - **Head**: outputs per-SQ: radii (a,b,c), shape (eps1,eps2), position (x,y,z), quaternion
 - Training uses Hydra config at `superdec/configs/train.yaml`
-
-## Building OpenGJK (standalone geometry validation only)
-
-OpenGJK is **not part of the planning pipeline**. Build it only if you need to
-cross-validate SQ geometry against an independent collision library.
-```bash
-cmake -B openGJK/build -DCMAKE_BUILD_TYPE=Release -DBUILD_GPU=ON \
-  -S openGJK -DCMAKE_CUDA_ARCHITECTURES=89
-cmake --build openGJK/build
-ctest --test-dir openGJK/build
-```
