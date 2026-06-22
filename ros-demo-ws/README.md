@@ -36,7 +36,7 @@ directory:
 uv venv --python 3.11
 source .venv/bin/activate
 
-cd ../curobov2&/curobo
+cd ../curobov2/curobo
 uv pip install .[cu13-torch]
 
 cd - 
@@ -97,7 +97,7 @@ some utilities.
 
 ROS interface to cuRobo. This node consumes a scene representation via a topic
 (`/scence_superquadrics`) and provides moving the arm and manipulating objects
-via two actions (`/move_arm`, `/grasp_object`, `/release_object`). The
+via actions (`/move_arm`, `/grasp_object`, `/release_object`). The
 manipultion actions also update the robot model for the purposes of
 collision-free planning.
 
@@ -113,7 +113,7 @@ Republishes the data from a superquadric topic as visualization messages vor RVi
 
 ### `scene_renderer.py`
 
-This node manages a superquadric scene representations, consumed on-demand from
+This node manages a superquadric scene representation, consumed on-demand from
 a topic (`/scene`). Updates can be triggered via a service, and the current
 scene is regularly published as a flat list of superquadrics
 (`/scene_superquadrics`). The manager enables editing of the scene through
@@ -127,7 +127,6 @@ This node uses our perception pipeline to process incoming depth images
 (`/camera/depth/image`) and publishes a superquadric scene for the rest of the
 system, both as a structrued and as a flattened representation. It also
 publishes intermediate results for visualization.
-
 
 ### `depth_image_m_to_mm.py`
 
@@ -143,4 +142,5 @@ its functionality.
 
 ## `superquadric_interfaces`
 
-This package contains all the custom message definitions (messages, services and actions).
+This package contains all the custom message definitions (messages, services and 
+actions) used in this project.
