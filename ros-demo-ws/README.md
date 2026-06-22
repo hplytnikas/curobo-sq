@@ -1,6 +1,10 @@
 # ROS Manipulation Demo
 
-This folder is a workspace for a small tabletop demonstration demo. There are a few quirks to the setup to get ROS packages working with python dependencies that conflict with ROS/system python. **Ensure that you have pulled the submodules in this repo.** The results of the demo are shown in ![this video](demo.mp4).
+This folder is a workspace for a small tabletop demonstration demo. There are a
+few quirks to the setup to get ROS packages working with python dependencies
+that conflict with ROS/system python. **Ensure that you have pulled the
+submodules in this repo.** The results of the demo are shown in ![this
+video](demo.mp4).
 
 
 ## Setup
@@ -44,8 +48,10 @@ cd ../project_3dv
 uv pip install -e .
 ```
 
-The demo also depends on SuperDec/Superflex. After acquiring a copy of the source code,
-also install it into the venv as described in the finetuning section of this repo.
+The demo also depends on SuperDec/Superflex. A version of SuperDec is present in
+this repo, alternatively, acquire copy of SuperFlex' source code. Install your
+choice into the venv, following the instruction described in the finetuning
+section of this repo for SuperFlex.
 
 ### Building the workspace
 
@@ -57,6 +63,18 @@ colcon build --cmake-args -DBUILD_TESTS=OFF
 ```
 
 ### Running the demo
+
+The perception pipeline needs the follwing environment variables:
+
+``` sh
+export SUPERDEC_DIR="<path to superdec/flex module>"
+export SUPERDEC_CKPT_DIR="<path to superdec checkpoint directory>"
+```
+
+Make sure to select matching checkpoints! For SuperFlex, pick
+`curobo-sq/finetuning/checkpoints/expocc_tt_bent/`, and for SuperDec, pick
+`curobo-sq/finetuning/checkpoints/expocc_tt_chamfer/`.
+
 
 In seperate terminals, run each of the following sections. There is no single
 launchfile, as some nodes need to be run with the venv python interpreter.
