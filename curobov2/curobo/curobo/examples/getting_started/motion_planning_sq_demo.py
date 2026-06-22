@@ -881,7 +881,11 @@ def _rebuild_planner(
     world_representation: str,
     device_cfg: DeviceCfg,
 ) -> MotionPlanner:
-    use_cg = world_representation != "superquadrics"
+    # CUDA graphs are enabled for ALL representations (including superquadrics) so
+    # that timing comparisons are apples-to-apples: otherwise SQ pays full per-kernel
+    # launch overhead on every optimizer iteration while mesh/pointcloud replay a
+    # captured graph, which can make mesh look faster purely as a harness artifact.
+    use_cg = True
     pcfg = MotionPlannerCfg.create(
         robot="franka.yml",
         scene_model="collision_test.yml",

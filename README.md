@@ -21,17 +21,18 @@ The pipeline has four components:
 
 1. [Environment & Build](#environment--build)
 2. [Quick Start](#quick-start)
-3. [CuRobo v1 — Changed Files](#curobo-v1--changed-files)
-4. [CuRobo v1 — Python API: Superquadric Types](#curobo-v1--python-api-superquadric-types)
-5. [CuRobo v1 — Python API: Collision World](#curobo-v1--python-api-collision-world)
-6. [CuRobo v1 — CUDA Kernel API](#curobo-v1--cuda-kernel-api)
-7. [CuRobo v1 — Integration Demo CLI Reference](#curobo-v1--integration-demo-cli-reference)
-8. [CuRobo v1 — Architecture](#curobo-v1--architecture)
-9. [Superquadric SDF Math](#superquadric-sdf-math)
-10. [CuRobo v2 — Changed Files](#curobo-v2--changed-files)
-11. [CuRobo v2 — Python API](#curobo-v2--python-api)
-12. [CuRobo v2 — Examples & Tests](#curobo-v2--examples--tests)
-13. [CuRobo v1 vs v2 — Comparison](#curobo-v1-vs-v2--comparison)
+3. [Reproducing the Paper Results](#reproducing-the-paper-results)
+4. [CuRobo v1 — Changed Files](#curobo-v1--changed-files)
+5. [CuRobo v1 — Python API: Superquadric Types](#curobo-v1--python-api-superquadric-types)
+6. [CuRobo v1 — Python API: Collision World](#curobo-v1--python-api-collision-world)
+7. [CuRobo v1 — CUDA Kernel API](#curobo-v1--cuda-kernel-api)
+8. [CuRobo v1 — Integration Demo CLI Reference](#curobo-v1--integration-demo-cli-reference)
+9. [CuRobo v1 — Architecture](#curobo-v1--architecture)
+10. [Superquadric SDF Math](#superquadric-sdf-math)
+11. [CuRobo v2 — Changed Files](#curobo-v2--changed-files)
+12. [CuRobo v2 — Python API](#curobo-v2--python-api)
+13. [CuRobo v2 — Examples & Tests](#curobo-v2--examples--tests)
+14. [CuRobo v1 vs v2 — Comparison](#curobo-v1-vs-v2--comparison)
 
 ---
 
@@ -84,6 +85,181 @@ omni_python curobo/tests/test_sq_rotation.py
 omni_python curobo/tests/test_sq_motion_gen_headless.py
 omni_python curobo/tests/test_sq_clpt.py
 ```
+
+---
+
+## Reproducing the Paper Results
+
+The paper experiments live in
+`curobov2/curobo/curobo/examples/paper/` and run on the **CuRobo v2** (Warp)
+backend. There are two artefacts:
+
+| Script | What it is |
+|--------|------------|
+| `motion_planning_sq_demo.py` | Interactive Viser demo — tabletop scenes built from ShapeNet/GSO objects, decomposed by SuperDec into superquadrics, with live SQ↔mesh switching and motion planning. |
+| `benchmark_sq_vs_mesh.py` + `plot_benchmark.py` | The quantitative benchmark — plans a sequential tour over a family of scenes with increasing object counts (1…200) for both the SQ and mesh representations, then plots planning time, motion time, and ground-truth collision rate. |
+
+All paper commands run inside the **`3dv` conda environment** (not
+`~/isaacsim/python.sh`). The scripts resolve paths relative to the workspace
+root `/home/haroldas/3DV`, so they can be launched from any directory; the
+examples below assume you `cd` into the paper folder first:
+
+```bash
+cd curobov2/curobo/curobo/examples/paper
+```
+
+Pick **one** of the two paths below.
+
+---
+
+### Prerequisites (both paths)
+
+Clone this repository (with its `superdec/`, `curobo/`, and `curobov2/`
+subtrees), then create the `3dv` environment and install the two packages that
+the paper scripts import — **CuRobo v2** and **SuperDec**:
+
+```bash
+# 1. Create / activate the environment
+conda create -n 3dv python=3.11 -y
+conda activate 3dv
+
+# 2. CuRobo v2 (Warp backend — no CUDA C++ build needed, installed editable)
+conda run -n 3dv python -m pip install -e curobov2/curobo --no-build-isolation
+
+# 3. SuperDec (neural superquadric decomposition)
+cd superdec
+conda run -n 3dv python -m pip install -r requirements.txt
+conda run -n 3dv python -m pip install -e .
+cd -
+```
+
+Verify the imports resolve:
+
+```bash
+conda run -n 3dv python -c "import curobo, superdec, warp, torch; print('ok', torch.__version__)"
+```
+
+GPU: an Ada-class card (RTX 4090 / arch 8.9) with CUDA 12.8 in `PATH` is the
+reference setup.
+
+---
+
+### Option A — Reproduce from scratch
+
+Regenerates every scene from the raw datasets and re-runs SuperDec inference.
+Choose this if you want to verify the full pipeline end to end (it is slower and
+needs ~tens of GB of dataset downloads).
+
+**1. Download the SuperDec checkpoint.** The paper uses the
+`tabletop_finetuned` checkpoint (must contain `ckpt.pt` and `config.yaml`):
+
+```
+superdec/checkpoints/tabletop_finetuned/
+├── ckpt.pt
+└── config.yaml
+```
+
+> **Download link (checkpoint):** _TODO — paste link here_
+> Unzip into `superdec/checkpoints/tabletop_finetuned/`.
+
+**2. Download the object datasets** into `data/ShapeNet/` (relative to the
+workspace root `/home/haroldas/3DV`). Both datasets use the ONet/ConvONet
+point-cloud format — one `pointcloud.npz` per object — and live in the same
+tree:
+
+```
+data/ShapeNet/
+├── 02876657/<model_id>/pointcloud.npz   # Bottle
+├── 02880940/<model_id>/pointcloud.npz   # Bowl
+├── 03624134/<model_id>/pointcloud.npz   # Knife
+├── 03642806/<model_id>/pointcloud.npz   # Laptop
+├── 03797390/<model_id>/pointcloud.npz   # Mug
+└── gso/<object_name>/pointcloud.npz      # Google Scanned Objects
+```
+
+- **ShapeNet** — the five tabletop synsets above
+  (`Bottle, Bowl, Knife, Laptop, Mug`), in ONet format. This is the dataset the
+  paper scenes are built from.
+- **GSO** (Google Scanned Objects) — flat `gso/<object>/pointcloud.npz`, used by
+  the GSO scenes.
+
+> **Download link (ShapeNet + GSO point clouds):** _TODO — paste link here_
+> Unzip so the contents land directly under `data/ShapeNet/` as shown above.
+
+> _Alternative:_ the demo also accepts the PyG part-annotation ShapeNet as a
+> fallback (`conda run -n 3dv python -c "from torch_geometric.datasets import
+> ShapeNet; ShapeNet(root='data/ShapeNet', split='test')"`), but this is a
+> different set and will not reproduce the exact paper scenes.
+
+**3. Run the interactive demo** (optional sanity check, opens a Viser web UI on
+`http://localhost:8080`):
+
+```bash
+conda run -n 3dv python motion_planning_sq_demo.py \
+    --checkpoint_folder /home/haroldas/3DV/superdec/checkpoints/tabletop_finetuned
+```
+
+Useful flags: `--world_representation {superquadrics,mesh}` (initial mode),
+`--mesh_resolution 48`, `--port 8080`, `--gso_only`, `--num_scenes N`.
+
+**4. Run the benchmark** (three subcommands, in order):
+
+```bash
+# a) Build & cache the scene family (runs SuperDec once → eval_out/scenes_cache.pkl)
+conda run -n 3dv python benchmark_sq_vs_mesh.py build
+
+# b) Set 4 end-effector targets per scene in a Viser UI → eval_out/targets.json
+conda run -n 3dv python benchmark_sq_vs_mesh.py set-targets --port 8081
+
+# c) Plan SQ vs mesh for every scene → eval_out/results.csv
+conda run -n 3dv python benchmark_sq_vs_mesh.py benchmark
+
+# d) Generate the figures from results.csv
+conda run -n 3dv python plot_benchmark.py
+```
+
+Outputs land in `curobov2/curobo/curobo/examples/paper/eval_out/`:
+`results.csv`, `objects_vs_planning_time.png`, `objects_vs_motion_time.png`,
+`objects_vs_collision.png`. Restrict the object counts with `--counts 1,5,10`.
+
+---
+
+### Option B — Run with preset scenes (fast)
+
+Skips the dataset downloads and SuperDec inference by reusing the pre-built
+scene cache and saved targets from the paper. This is enough to reproduce the
+benchmark numbers and figures.
+
+**1. Download the preset scene cache and targets** and place them in the
+benchmark output directory:
+
+```
+curobov2/curobo/curobo/examples/paper/eval_out/
+├── scenes_cache.pkl   (~540 MB — SuperDec already run, scenes frozen)
+└── targets.json       (4 end-effector targets per scene)
+```
+
+> **Download link (scenes_cache.pkl + targets.json):** _TODO — paste link here_
+
+```bash
+mkdir -p curobov2/curobo/curobo/examples/paper/eval_out
+# move the downloaded scenes_cache.pkl and targets.json into that folder
+```
+
+The scene cache already contains the SuperDec superquadric predictions, so
+**no checkpoint and no ShapeNet/GSO download are required** for the benchmark.
+
+**2. Run the benchmark and plot** directly:
+
+```bash
+cd curobov2/curobo/curobo/examples/paper
+conda run -n 3dv python benchmark_sq_vs_mesh.py benchmark
+conda run -n 3dv python plot_benchmark.py
+```
+
+> **Note:** the interactive `motion_planning_sq_demo.py` regenerates its scenes
+> live from ShapeNet/GSO, so it still needs the checkpoint and datasets from
+> Option A. The preset path covers the quantitative benchmark, not the live demo.
 
 ---
 

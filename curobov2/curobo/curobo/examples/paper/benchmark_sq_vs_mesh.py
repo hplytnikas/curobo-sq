@@ -119,7 +119,7 @@ def scene_geometry(n: int) -> Tuple[float, float, float, float]:
         outer_r = 1.2
     elif n == 200:
         outer_r = 2.0
-    object_size_m = 0.27 if n <= 25 else (0.225 if n <= 100 else 0.18)
+    object_size_m = 0.54 if n <= 25 else (0.45 if n <= 100 else 0.36)
     table_half = outer_r + 0.20
     return inner_r, outer_r, table_half, object_size_m
 
@@ -613,29 +613,23 @@ def _build_scene_cfg(scene: dict, representation: str) -> Tuple[SceneCfg, int]:
     """Build the collision SceneCfg for one representation; return (cfg, n_primitives).
 
     superquadrics  one Superquadric per primitive (via demo._prediction_to_scene_cfg)
-    mesh           one Mesh per superquadric (NOT fused per object)
+    mesh           one fused Mesh per object (same as demo._prediction_to_scene_cfg)
     shapenet_mesh  one Mesh per object, from the original ShapeNet mesh
     """
     table = _make_table(scene_geometry(scene["n_objects"])[2])
     demo.TABLE = table  # demo._prediction_to_scene_cfg reads this global
 
-    if representation == "superquadrics":
+    if representation in ("superquadrics", "mesh"):
         cfg = demo._prediction_to_scene_cfg(
-            _scene_predictions(scene), "superquadrics", 1.0,
+            _scene_predictions(scene), representation, 1.0,
             demo.SCENE_TRANSLATION, demo.SCENE_QUAT_WXYZ, torch.zeros(1),
         )
-        return cfg, demo._count_items(cfg.superquadric)
+        n = (demo._count_items(cfg.superquadric) if representation == "superquadrics"
+             else demo._count_items(cfg.mesh))
+        return cfg, n
 
     meshes: List[Mesh] = []
-    if representation == "mesh":
-        for p in scene["predictions"]:
-            for k, (v, f) in enumerate(p["sq_meshes"]):
-                meshes.append(Mesh(
-                    name=f"obj_{p['iid']}_sq_{k}",
-                    vertices=v.tolist(), faces=f.tolist(),
-                    pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
-                ))
-    elif representation == "pointcloud":
+    if representation == "pointcloud":
         # Native curobo: voxel-surface mesh of the real per-object point cloud.
         for p, pts in zip(scene["predictions"], scene["object_pts"]):
             meshes.append(Mesh.from_pointcloud(
@@ -692,7 +686,11 @@ def benchmark_one(
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t0 = time.perf_counter()
-        result = planner.plan_pose(goal, active_js, use_implicit_goal=True, max_attempts=3)
+        try:
+            result = planner.plan_pose(goal, active_js, use_implicit_goal=True, max_attempts=3)
+        except Exception as exc:
+            print(f"  [{representation}] {scene['name']} leg {leg + 1}: plan_pose raised: {exc}")
+            result = None
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         plan_wall = time.perf_counter() - t0
