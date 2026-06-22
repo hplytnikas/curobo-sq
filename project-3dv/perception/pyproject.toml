@@ -1,0 +1,22 @@
+[project]
+name = "tabletop-perception"
+version = "0.1.0"
+description = "Standalone RGB-D tabletop perception pipeline — table removal, instance segmentation, and superquadric fitting (LM baseline + SuperDec neural fitter)."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "scipy",
+    "open3d",
+    "plyfile",
+]
+
+[project.optional-dependencies]
+superdec = ["torch"]
+
+[tool.setuptools]
+py-modules = ["pipeline", "superquadric", "superdec_fitter", "superdec_utils", "paths"]
+packages = ["datasets", "evaluation"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
