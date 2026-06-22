@@ -17,53 +17,46 @@ The pipeline has two components:
 
 ## Table of Contents
 
-1. [Environment & Build](#environment--build)
-2. [Quick Start](#quick-start)
-3. [Reproducing the Paper Results](#reproducing-the-paper-results)
-4. [Superquadric SDF Math](#superquadric-sdf-math)
-5. [CuRobo - Changed Files](#curobo--changed-files)
-6. [CuRobo - Python API](#curobo--python-api)
+1. [Install](#install)
+2. [Reproducing the Paper Results](#reproducing-the-paper-results)
+3. [Superquadric SDF Math](#superquadric-sdf-math)
+4. [CuRobo - Changed Files](#curobo--changed-files)
+5. [CuRobo - Python API](#curobo--python-api)
 
 ---
 
-## Environment & Build
-
-The superquadric code and the paper experiments run in the **`3dv` conda
-environment**. See [Reproducing the Paper Results](#reproducing-the-paper-results)
-for the full install (PyTorch cu128 + editable CuRobo v2 + SuperDec).
-
-**No build step is required.** Superquadric collision is implemented in
-[NVIDIA Warp](https://github.com/NVIDIA/warp) - GPU kernels written in Python and
-JIT-compiled at runtime - so there is no CUDA C++ to compile. To run the
-`curobov2/curobo/curobo/examples/getting_started` SQ examples outside the conda
-env, point `PYTHONPATH` at the v2 source tree (from the repository root):
+## Install
 
 ```bash
-export PYTHONPATH="$PWD/curobov2/curobo"
-export PATH=/usr/local/cuda-12.8/bin:/usr/bin:$PATH
+# Run all install commands from the repo root
+cd /path/to/3DV   # adjust to wherever you cloned the repo
+
+# (Ubuntu 25.04+) GCC 15 is incompatible with CUDA 12.8 headers.
+# Install GCC 14 — SuperDec's JIT backend selects it automatically.
+sudo apt install gcc-14 g++-14
+
+# Environment
+conda create -n 3dv python=3.11 -y
+conda activate 3dv
+
+# PyTorch (CUDA 12.8 wheels)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+
+# CuRobo v2 kernel backend (no compilation required)
+pip install 'cuda-core[cu12]'
+
+# CuRobo v2 (Warp backend - no CUDA C++ build), then SuperDec, both editable
+pip install -e curobov2/curobo --no-build-isolation
+pip install -r superdec/requirements.txt && pip install -e superdec --no-build-isolation
+
+# Benchmark / plotting extras
+pip install pandas scipy scikit-learn
+
+# Sanity check
+python -c "import curobo, superdec, warp, torch; print('ok', torch.__version__)"
 ```
 
-GPU: an Ada-class card (RTX 4090 / arch 8.9) with CUDA 12.8 is the reference setup.
-
----
-
-## Quick Start
-
-```bash
-# 1. Reproduce the paper benchmark (download assets first - see the section below)
-cd curobov2/curobo/curobo/examples/paper
-conda run -n 3dv python benchmark_sq_vs_mesh.py benchmark   # → eval_out/results.csv
-conda run -n 3dv python plot_benchmark.py                   # → eval_out/objects_vs_*.png
-
-# 2. Run the superquadric SDF unit/integration tests
-conda run -n 3dv python \
-  curobov2/curobo/curobo/tests/_src/geom/test_superquadric_sdf.py
-
-# 3. Interactive tabletop demo (Viser web UI on http://localhost:8080)
-conda run -n 3dv python \
-  curobov2/curobo/curobo/examples/paper/motion_planning_sq_demo.py
-```
-
+GPU: an Ada-class card (RTX 4070 Ti Super / arch 8.9) with CUDA 12.8 is the reference setup.
 
 ---
 
@@ -108,30 +101,7 @@ For just the **fast path** (reproduce the benchmark numbers and figures) you onl
 need `scenes_cache.pkl` - the cache already contains the SuperDec predictions, so
 no checkpoint and no ShapeNet are required.
 
-### 2. Install
-
-```bash
-# Environment
-conda create -n 3dv python=3.11 -y
-conda activate 3dv
-
-# PyTorch (CUDA 12.8 wheels)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-
-# CuRobo v2 (Warp backend - no CUDA C++ build), then SuperDec, both editable
-pip install -e curobov2/curobo --no-build-isolation
-pip install -r superdec/requirements.txt && pip install -e superdec --no-build-isolation
-
-# Benchmark / plotting extras
-pip install pandas scipy scikit-learn
-
-# Sanity check
-python -c "import curobo, superdec, warp, torch; print('ok', torch.__version__)"
-```
-
-GPU: an Ada-class card (RTX 4090 / arch 8.9) with CUDA 12.8 is the reference setup.
-
-### 3. Run - fast path (only `scenes_cache.pkl`)
+### 2. Run - fast path (only `scenes_cache.pkl`)
 
 Reproduces the benchmark numbers and figures with no checkpoint or ShapeNet:
 
@@ -141,7 +111,7 @@ conda run -n 3dv python plot_benchmark.py                   # → eval_out/objec
 conda run -n 3dv python plot_benchmark_paper.py             # → eval_out/paper_*.png
 ```
 
-### 4. Run - full pipeline (needs `ShapeNet_test` + `tabletop_finetuned`)
+### 3. Run - full pipeline (needs `ShapeNet_test` + `tabletop_finetuned`)
 
 Regenerates every scene from the dataset and re-runs SuperDec inference:
 
@@ -162,7 +132,7 @@ Restrict object counts with `--counts 1,5,10`; the mesh-fidelity sweep is
 `benchmark_sq_vs_mesh.py benchmark --fidelity`. `targets.json` and `results.csv`
 are in the repository, so the figures can be regenerated without re-running anything.
 
-### 5. What each file in `paper/` does
+### 4. What each file in `paper/` does
 
 | File | Role |
 |------|------|
